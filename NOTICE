@@ -1,0 +1,8 @@
+AgentRuntime CLI
+Copyright 2026 AgentRuntime
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by third parties under their own
+licenses, including github.com/spf13/cobra (Apache-2.0) and
+github.com/modelcontextprotocol/go-sdk.

@@ -1,0 +1,41 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish. The installers (install.ps1 / install.sh) and the
+# self-updater download from  https://github.com/<org>/agentruntime-cli/releases/latest/download/…
+# so the install scripts are attached to every release alongside the binaries.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest # scripts/release.ps1 is verified on Windows PowerShell/pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build release archives
+        shell: pwsh
+        run: ./scripts/release.ps1 -Version "${{ github.ref_name }}"
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $assets = @(Get-ChildItem dist -File | ForEach-Object { $_.FullName })
+          $assets += (Resolve-Path scripts/install.ps1).Path
+          $assets += (Resolve-Path scripts/install.sh).Path
+          $flags = @("--title", "${{ github.ref_name }}", "--generate-notes")
+          if ("${{ github.ref_name }}" -match "-") { $flags += "--prerelease" }  # e.g. v0.2.0-rc1
+          gh release create "${{ github.ref_name }}" @assets @flags
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

@@ -1,0 +1,5 @@
+# install.sh is piped to `sh` on Linux/macOS; CRLF line endings would break it.
+*.sh text eol=lf
+*.go text eol=lf
+*.yml text eol=lf
+checksums.txt text eol=lf
