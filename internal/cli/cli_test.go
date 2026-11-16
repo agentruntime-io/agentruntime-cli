@@ -289,7 +289,8 @@ func TestToolsListDescribeAndCall(t *testing.T) {
 func TestToolErrorsSurfaceMessage(t *testing.T) {
 	isolate(t)
 	srv := newFakeServer(t)
-	code, _, errOut := run(t, "", "--url", srv.URL, "--pat", testToken, "vault", "delete", "a/b", "--yes")
+	// (`secrets delete` calls the API directly now, see secrets_versions_test.go; the generic call still goes through Platform MCP.)
+	code, _, errOut := run(t, "", "--url", srv.URL, "--pat", testToken, "call", "vault_secrets_delete", "--arg", "path=a/b")
 	if code != 1 || !strings.Contains(errOut, "risk group disabled") {
 		t.Errorf("code=%d err=%q", code, errOut)
 	}

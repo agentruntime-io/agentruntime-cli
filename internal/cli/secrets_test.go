@@ -1315,7 +1315,8 @@ func TestVaultReadIsGoneAndUnknownWordsFail(t *testing.T) {
 	}
 }
 
-func TestSecretsListAndDeleteViaMCP(t *testing.T) {
+// secrets list goes through Platform MCP; delete and the version commands call the API (secrets_versions_test.go).
+func TestSecretsListViaMCP(t *testing.T) {
 	isolate(t)
 	srv := newFakeServer(t)
 	base := []string{"--url", srv.URL, "--pat", testToken}
@@ -1335,14 +1336,6 @@ func TestSecretsListAndDeleteViaMCP(t *testing.T) {
 	// The old spelling still works.
 	if code, _, _ := run(t, "", append(base, "vault", "ls")...); code != 0 {
 		t.Errorf("vault ls: exit %d", code)
-	}
-
-	code, _, _ = run(t, "", append(base, "secrets", "delete", "a/b", "--yes", "--scope", "user")...)
-	if code != 1 { // the fake server answers with an error for delete
-		t.Errorf("delete exit %d, want 1", code)
-	}
-	if got := srv.last("vault_secrets_delete"); got["path"] != "a/b" || got["scope"] != "user" {
-		t.Errorf("delete request = %v", got)
 	}
 }
 

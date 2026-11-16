@@ -1,5 +1,7 @@
 // Package bffclient is the small HTTPS client for the AgentRuntime API routes
-// the CLI needs beyond Platform MCP: POST /v1/secrets/fetch.
+// the CLI needs beyond Platform MCP: POST /v1/secrets/fetch (the only call that
+// returns secret values) and the secret history, restore, Recently-deleted and
+// settings routes (vault.go), which never carry a value.
 //
 // Secret values must never reach an LLM, so this is plain REST and not an MCP
 // tool. Nothing in this package logs or formats a response body.
@@ -219,14 +221,41 @@ func (c *Client) post(ctx context.Context, refs []string, check bool) ([]byte, e
 		return nil, fmt.Errorf("the request is larger than the server accepts (%d bytes): use fewer or shorter references", MaxRequestBytes)
 	}
 
+	reply, err := c.send(ctx, http.MethodPost, fetchPath, nil, payload)
+	if err != nil {
+		return nil, err
+	}
+	if reply.Status == http.StatusOK {
+		return reply.Body, nil
+	}
+	return nil, apiError(reply.Status, reply.Header, reply.Body, fetchFallbacks)
+}
+
+// reply is one answer from the API: status, headers and the (size-capped) body.
+type reply struct {
+	Status int
+	Header http.Header
+	Body   []byte
+}
+
+// send makes one authenticated request and reads the answer. A JSON payload is sent when it is not nil; query
+// is added to the URL. Redirects are never followed. Errors carry the address, never a header or a body.
+func (c *Client) send(ctx context.Context, method, path string, query url.Values, payload []byte) (*reply, error) {
 	u := *c.base
-	u.Path += fetchPath
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	u.Path += path
+	u.RawQuery = query.Encode()
+	var body io.Reader
+	if payload != nil {
+		body = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", version.UserAgent())
 
@@ -237,17 +266,14 @@ func (c *Client) post(ctx context.Context, refs []string, check bool) ([]byte, e
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswerBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswerBytes+1))
 	if err != nil {
 		return nil, errors.New("could not read the answer from the server")
 	}
-	if len(body) > maxAnswerBytes {
+	if len(raw) > maxAnswerBytes {
 		return nil, errors.New("the answer from the server is larger than expected; nothing was used")
 	}
-	if resp.StatusCode == http.StatusOK {
-		return body, nil
-	}
-	return nil, apiError(resp, body)
+	return &reply{Status: resp.StatusCode, Header: resp.Header, Body: raw}, nil
 }
 
 func unwrapURLError(err error) error {
@@ -258,8 +284,10 @@ func unwrapURLError(err error) error {
 	return err
 }
 
-func apiError(resp *http.Response, body []byte) *APIError {
-	e := &APIError{Status: resp.StatusCode}
+// apiError builds the error for a non-success answer. fallbacks supplies the sentence for a code or a status when
+// the server sent none of its own.
+func apiError(status int, header http.Header, body []byte, fallbacks fallbackSet) *APIError {
+	e := &APIError{Status: status}
 	var ans struct {
 		Error   string   `json:"error"`
 		Message string   `json:"message"`
@@ -275,11 +303,11 @@ func apiError(resp *http.Response, body []byte) *APIError {
 			}
 		}
 	}
-	if ra := strings.TrimSpace(resp.Header.Get("Retry-After")); ra != "" && len(ra) <= 6 && isDigits(ra) {
+	if ra := strings.TrimSpace(header.Get("Retry-After")); ra != "" && len(ra) <= 6 && isDigits(ra) {
 		e.RetryAfter = ra
 	}
 	if e.Message == "" {
-		e.Message = fallbackMessage(e.Code, e.Status)
+		e.Message = fallbacks.message(e.Code, e.Status)
 	}
 	return e
 }
@@ -287,7 +315,7 @@ func apiError(resp *http.Response, body []byte) *APIError {
 // fallbackMessages are used only when the server sent no sentence of its own
 // (an old server, a proxy error page). They use the same fixed codes as the
 // server and, like the server's, never say why a secret was not found.
-var fallbackMessages = map[string]string{
+var fetchMessages = map[string]string{
 	"fetch_key_required": "Only an access key can fetch secret values. Sign in with an access key (agentruntime login), not a browser or OAuth session.",
 	"missing_scope":      "This access key does not carry the \"Fetch secret values\" scope (secrets:fetch).",
 	"fetch_disabled":     "Fetching secret values with access keys is turned off for this workspace.",
@@ -301,10 +329,22 @@ var fallbackMessages = map[string]string{
 	"audit_failed":       "The request could not be recorded, so nothing was returned. Try again later.",
 }
 
-func fallbackMessage(code string, status int) string {
-	if m, ok := fallbackMessages[code]; ok {
+// fallbackSet is the sentences used for one family of routes when the server sent none.
+type fallbackSet struct {
+	byCode   map[string]string
+	byStatus func(status int) string
+}
+
+func (f fallbackSet) message(code string, status int) string {
+	if m, ok := f.byCode[code]; ok {
 		return m
 	}
+	return f.byStatus(status)
+}
+
+var fetchFallbacks = fallbackSet{byCode: fetchMessages, byStatus: fetchStatusMessage}
+
+func fetchStatusMessage(status int) string {
 	switch status {
 	case http.StatusUnauthorized:
 		return "The server did not accept the access key (HTTP 401): it may be invalid, expired or revoked. Run `agentruntime login`."

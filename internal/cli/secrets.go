@@ -25,6 +25,10 @@ const secretsLong = `Workspace secrets: list and save them, and use them from sc
   agentruntime secrets run --env STRIPE_KEY=workspace/live/stripe#API_KEY -- python job.py
   agentruntime secrets check workspace/live/stripe#API_KEY
   agentruntime secrets get workspace/live/stripe#API_KEY --print   # terminal only
+  agentruntime secrets history live/stripe --scope tenant          # who changed it, never values
+  agentruntime secrets restore live/stripe --version 2 --scope tenant
+  agentruntime secrets deleted --scope tenant                      # Recently deleted
+  agentruntime secrets undelete live/stripe --scope tenant
 
 A secret reference is  [secret:]<room>/<path>[#<field>]  where the room is my
 (your own secrets), project (the key's project) or workspace. With #field it is
@@ -33,10 +37,12 @@ when exactly one room holds it; otherwise the command fails and lists the rooms.
 run's --env-from and --secret-file take several fields at once, which you name
 yourself: REF#FIELD1,FIELD2.
 
-list, set and delete go through Platform MCP like every other command. run, check
-and get call the API directly with the same access key, and need a key that
-carries the "Fetch secret values" scope (secrets:fetch) and the secrets chosen
-for it. 'vault' is an older name for this command and still works.`
+list and set go through Platform MCP like every other command. run, check and get
+call the API directly with the same access key, and need a key that carries the
+"Fetch secret values" scope (secrets:fetch) and the secrets chosen for it. The
+version commands (history, restore, deleted, undelete, delete, and the settings
+flags of set) also call the API directly with the same key; none of them ever
+shows a secret's value. 'vault' is an older name for this command and still works.`
 
 // scopeHelp names the rooms of the Secrets page in the Console.
 const scopeHelp = "room: user (My secrets), project, tenant (workspace) or shared (shared with you; read-only)"
@@ -65,11 +71,12 @@ func (a *App) secretsCmd() *cobra.Command {
 	cmd.AddCommand(
 		a.secretsListCmd(), a.secretsSetCmd(), a.secretsDeleteCmd(),
 		a.secretsRunCmd(), a.secretsCheckCmd(), a.secretsGetCmd(),
+		a.secretsHistoryCmd(), a.secretsRestoreCmd(), a.secretsDeletedCmd(), a.secretsUndeleteCmd(),
 	)
 	return cmd
 }
 
-// ---- list / set / delete (Platform MCP tools) --------------------------------------
+// ---- list / set (Platform MCP tools; delete, history and the rest are in secrets_versions.go) ---
 
 func (a *App) secretsListCmd() *cobra.Command {
 	var scope, prefix string
@@ -94,9 +101,11 @@ func (a *App) secretsListCmd() *cobra.Command {
 }
 
 func (a *App) secretsSetCmd() *cobra.Command {
-	var scope, dataJSON, dataFile string
+	var scope, dataJSON, dataFile, apiURL string
 	var kv, removeKeys []string
 	var create, update bool
+	var description, keepVersions, expireAfter string
+	var labels, removeLabels []string
 	cmd := &cobra.Command{
 		Use:   "set <path>",
 		Short: "Create or update a secret (the value is never printed back)",
@@ -110,13 +119,33 @@ Keep values off the command line. A value written as -d key=value or --data is
 part of the command line, so it lands in your shell history and in the process
 list. Give the values in a file instead: --data-file FILE (a JSON object; "-"
 reads it from standard input) or -d key=@FILE (the field's value is the content
-of FILE, trailing line breaks removed).`,
+of FILE, trailing line breaks removed).
+
+Settings, applied after the save through the API with the same access key:
+
+  --description TEXT       what the secret is for (up to 500 characters; "" clears it)
+  --label k=v              set a label (repeatable); --label k is a tag with no value
+  --remove-label k         remove a label (repeatable)
+  --keep-versions N        keep the last N versions (1 to 100), or "default"
+  --expire-after DURATION  the secret moves to Recently deleted this long after it
+                           was last saved: 1h, 7d, 90d (1 hour to 365 days), or "never"
+
+Labels you do not name are kept. They are read and written back as a whole, so
+two people changing labels at the same moment can overwrite each other.
+--keep-versions and --expire-after save one more version of the secret so that
+they apply at once, and a lower --keep-versions removes the oldest versions
+for good. With settings flags and no data, only the settings change and no new
+version is saved. If the save works and the settings step fails, the command
+says so and exits 1: the secret is saved.`,
 		Example: `  agentruntime secrets set integrations/stripe --data-file stripe.json --create
   agentruntime secrets set integrations/stripe --data-file - --create < stripe.json
   agentruntime secrets set integrations/stripe -d api_key=@api_key.txt --update
   agentruntime secrets set integrations/stripe -d webhook_secret= --update    # blank keeps the stored value
   agentruntime secrets set integrations/stripe --update --remove-key webhook_secret
-  agentruntime secrets set integrations/gcp --data-file service-account.json --scope tenant`,
+  agentruntime secrets set integrations/gcp --data-file service-account.json --scope tenant
+  agentruntime secrets set integrations/stripe --description "Payments key" --label env=prod --label stripe
+  agentruntime secrets set integrations/stripe --keep-versions 5 --expire-after 90d
+  agentruntime secrets set integrations/stripe --remove-label stripe --expire-after never`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if create && update {
@@ -138,19 +167,70 @@ of FILE, trailing line breaks removed).`,
 					return &ExitErr{Code: ExitUsage, Err: fmt.Errorf("field %q is both set and removed", removeKeys[i])}
 				}
 			}
-			if len(data) == 0 && len(removeKeys) == 0 {
-				return &ExitErr{Code: ExitUsage, Err: errors.New("no data: use --data-file FILE (or - for stdin), -d key=@FILE, or -d key=value / --data (these two put the value on the command line)")}
+			plan, err := buildSettingsPlan(cmd, description, labels, removeLabels, keepVersions, expireAfter)
+			if err != nil {
+				return &ExitErr{Code: ExitUsage, Err: err}
 			}
-			req := map[string]any{"path": args[0], "data": data}
+			haveData := len(data) > 0 || len(removeKeys) > 0
 			switch {
-			case create:
-				req["mode"] = "create"
-			case update:
-				req["mode"] = "update"
+			case !haveData && plan.empty():
+				return &ExitErr{Code: ExitUsage, Err: errors.New("no data: use --data-file FILE (or - for stdin), -d key=@FILE, or -d key=value / --data (these two put the value on the command line)")}
+			case !haveData && (create || update):
+				return &ExitErr{Code: ExitUsage, Err: errors.New("--create and --update save data: give data, or leave them out to change only the settings")}
 			}
-			setIf(req, "remove_keys", removeKeys)
-			setIf(req, "scope", scope)
-			return a.call1(cmd, "vault_secrets_upsert", req)
+			// Everything the settings step needs is checked before the save, so a typo or a missing key
+			// never leaves a saved secret with settings that were not applied.
+			var room string
+			var api *bffclient.Client
+			if !plan.empty() {
+				if room, err = vaultScope(scope); err != nil {
+					return &ExitErr{Code: ExitUsage, Err: err}
+				}
+				if api, err = a.apiClient(apiURL); err != nil {
+					return err
+				}
+			}
+			var saved any
+			if haveData {
+				req := map[string]any{"path": args[0], "data": data}
+				switch {
+				case create:
+					req["mode"] = "create"
+				case update:
+					req["mode"] = "update"
+				}
+				setIf(req, "remove_keys", removeKeys)
+				setIf(req, "scope", scope)
+				if plan.empty() {
+					return a.call1(cmd, "vault_secrets_upsert", req)
+				}
+				// Both steps must act on the same room, so the save is sent the room the settings step uses (a left-out
+				// scope means the workspace room, what the API uses when it is not told).
+				req["scope"] = room
+				if saved, err = a.invoke(cmd, "vault_secrets_upsert", req, false); err != nil {
+					return err
+				}
+				if !a.flags.json {
+					if err := a.emit(saved); err != nil {
+						return err
+					}
+				}
+			}
+			details, err := a.applySettings(cmd, api, room, args[0], plan)
+			if err != nil {
+				if a.flags.json {
+					_ = render.JSON(a.Out, map[string]any{"saved": saved, "settings": nil})
+				}
+				if haveData {
+					return &ExitErr{Code: ExitError, Err: fmt.Errorf("the secret was saved, but its settings were not changed: %w", err)}
+				}
+				return &ExitErr{Code: ExitError, Err: fmt.Errorf("the settings were not changed: %w", err)}
+			}
+			if a.flags.json {
+				return render.JSON(a.Out, map[string]any{"saved": saved, "settings": details})
+			}
+			a.printSettingsDone(a.Out, args[0], plan)
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&scope, "scope", "", scopeHelp)
@@ -160,28 +240,12 @@ of FILE, trailing line breaks removed).`,
 	cmd.Flags().BoolVar(&create, "create", false, "create only: fail if the secret already exists")
 	cmd.Flags().BoolVar(&update, "update", false, "merge into the existing secret (blank value keeps the stored one)")
 	cmd.Flags().StringArrayVar(&removeKeys, "remove-key", nil, "field to delete from the secret (repeatable; needs --update)")
-	return cmd
-}
-
-func (a *App) secretsDeleteCmd() *cobra.Command {
-	var scope string
-	var yes bool
-	cmd := &cobra.Command{
-		Use:     "delete <path>",
-		Aliases: []string{"rm"},
-		Short:   "Delete a secret",
-		Args:    cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := a.confirmOrAbort(yes, fmt.Sprintf("Delete secret %s?", args[0])); err != nil {
-				return err
-			}
-			req := map[string]any{"path": args[0]}
-			setIf(req, "scope", scope)
-			return a.call1(cmd, "vault_secrets_delete", req)
-		},
-	}
-	cmd.Flags().StringVar(&scope, "scope", "", scopeHelp)
-	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip the confirmation prompt")
+	cmd.Flags().StringVar(&description, "description", "", "what the secret is for, up to 500 characters (\"\" clears it)")
+	cmd.Flags().StringArrayVar(&labels, "label", nil, "label k=v (repeatable); --label k is a tag with no value; labels you do not name are kept")
+	cmd.Flags().StringArrayVar(&removeLabels, "remove-label", nil, "label to remove (repeatable)")
+	cmd.Flags().StringVar(&keepVersions, "keep-versions", "", "keep the last N versions (1 to 100) or \"default\"; saves one more version; a lower N removes the oldest for good")
+	cmd.Flags().StringVar(&expireAfter, "expire-after", "", "move to Recently deleted this long after the last save: 1h, 7d, 90d (1 hour to 365 days) or \"never\"; saves one more version")
+	cmd.Flags().StringVar(&apiURL, "api-url", "", apiURLHelp+" (used for the settings flags)")
 	return cmd
 }
 

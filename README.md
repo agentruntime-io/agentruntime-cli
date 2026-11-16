@@ -82,6 +82,8 @@ agentruntime secrets run --env-from workspace/live/stripe#API_KEY,WEBHOOK_SECRET
 agentruntime secrets run --secret-file .env=workspace/live/app#DB_USER,DB_PASS -- docker compose up
 agentruntime secrets check workspace/live/stripe#API_KEY
 agentruntime secrets get workspace/live/stripe#API_KEY --print                # terminal only
+agentruntime secrets history live/stripe --scope tenant                       # who changed it, never values
+agentruntime secrets deleted --scope tenant                                   # Recently deleted
 ```
 
 **References.** `[secret:]<room>/<path>[#<field>]`. The room is `my` (your own secrets),
@@ -165,7 +167,8 @@ could move the cursor or write to the clipboard. `vault read` was removed.
 
 **`secrets set`** takes `--create` (fail if it exists) or `--update` (merge: a field given with a blank
 value keeps its stored value; `--remove-key NAME` deletes a field). `--scope` names the room:
-`user`, `project`, `tenant`, `shared`.
+`user`, `project`, `tenant`, `shared`. It also takes settings flags, see
+[Version history, recovery and settings](#version-history-recovery-and-settings).
 
 > **Keep values off the command line.** A value written as `-d key=value` or `--data '{...}'` is part
 > of the command line, so it ends up in your shell history and in the process list. Give the values
@@ -175,11 +178,85 @@ value keeps its stored value; `--remove-key NAME` deletes a field). `--scope` na
 > The inline forms stay available for blank values (`-d field=` keeps the stored value with
 > `--update`) and for non-secret fields.
 
+## Version history, recovery and settings
+
+Every save of a secret is a new version, and a deleted secret can be brought back. These commands
+call the API directly with the same access key as every other command (rights are the key owner's).
+**None of them shows a secret's value**: history lists who changed a secret, when, and the *names* of the
+fields they added, changed or removed. A person views an older value in the Console.
+
+```sh
+agentruntime secrets history live/stripe --scope tenant            # versions: when, who, which field names
+agentruntime secrets restore live/stripe --version 2 --scope tenant  # write version 2 back as a NEW version
+agentruntime secrets deleted --scope tenant                        # Recently deleted (and expired secrets)
+agentruntime secrets undelete live/stripe --scope tenant
+agentruntime secrets delete live/stripe --scope tenant             # to Recently deleted when the workspace supports it
+agentruntime secrets delete live/stripe --scope tenant --destroy --confirm live/stripe   # for good
+```
+
+`--scope` is `user`, `project` or `tenant` (the default) for all of them. A secret shared with you is
+read-only: use the room it really lives in. Every command takes `--json` and `--api-url`.
+
+- **`history <path>`** (alias `versions`) shows how many versions are kept, the auto-expire time,
+  the description and labels, and one row per version still kept: number, state (`current`, `available`,
+  `deleted`, `destroyed`), time, who saved it (the user id, and the name when the API gives one), its kind
+  (`create`, `update`, `restore`, `settings`, or `unknown`) and what changed (`restored from version N`,
+  `added A; changed B; removed C`: field names only). A version saved before history was recorded has
+  kind `unknown`, no author and no field names. Text from the
+  server (paths, field names, labels) is shown with control and invisible characters escaped.
+- **`restore <path> --version N`** writes version N back as a **new** current version. Nothing is lost:
+  the version it replaces stays in the history. You never see the value; the API reads and writes it.
+  `already_current` (it is the current version), `conflict` (the secret changed meanwhile, nothing was
+  written) and `version_unavailable` (that version is gone) are answered in plain words.
+- **`deleted`** lists a room's Recently deleted secrets: deleted ones and ones whose auto-expire passed
+  (why: `deleted` or `expired`). When the workspace cannot recover deleted secrets it says so and exits
+  `0`; with `--json` the answer is `{"supported": false, "items": []}` (and `{"supported": true, ...}`
+  otherwise). Only people who may delete in that room can list them.
+- **`undelete <path>`** brings a secret back with its versions, owner and sharing. A secret that expired
+  comes back with its auto-expire turned off, so it does not vanish again at the next save.
+- **`delete <path>`** says `Moved <path> to Recently deleted` when the API answers that it can be
+  recovered (header `X-Recoverable: true`), and `Deleted <path> permanently` otherwise (including an older
+  API that does not say). It asks first unless you pass `--yes`.
+- **`delete <path> --destroy --confirm <path>`** deletes for good, every version, also from Recently
+  deleted. It refuses unless `--destroy` and `--confirm` are both given, `--confirm` repeats the path
+  exactly (same case, no extra space), and `--scope` is given (a permanent delete never lands in a room you
+  did not name). It does not ask again: `--confirm` is the confirmation. The API accepts it from an access
+  key and the Console, not from an AI client.
+
+**Settings flags of `secrets set`**, applied after the save through the API:
+
+| Flag | Meaning |
+|---|---|
+| `--description TEXT` | what the secret is for, up to 500 characters (`""` clears it) |
+| `--label k=v` | set a label (repeatable); `--label k` is a tag with no value. Key: lower-case letters, digits, `.`, `_`, `-`, up to 40 characters; value up to 100 characters; at most 10 labels |
+| `--remove-label k` | remove a label (repeatable) |
+| `--keep-versions N` | keep the last N versions (1 to 100), or `default` (the workspace default) |
+| `--expire-after DURATION` | the secret moves to Recently deleted this long after it was last saved: `1h`, `7d`, `90d`, `2w` (1 hour to 365 days; units `s`, `m`, `h`, `d`, `w`), or `never` |
+
+- Every flag is checked before anything is saved, so a typo never leaves a saved secret with settings
+  that were not applied.
+- Labels you do not name are kept. The API replaces the labels as a whole, so `--label` and
+  `--remove-label` first read the current labels and write the merged set back: two people changing
+  labels at the same moment can overwrite each other.
+- `--keep-versions` and `--expire-after` save **one more version** of the secret (that is how they apply at
+  once). A lower `--keep-versions` removes the oldest versions for good. With `--expire-after` every save
+  restarts the clock, and after the time the secret is in Recently deleted: a script that reads it stops
+  finding it. They need the secret's owner or a room manager; description and labels need the right to
+  change the secret.
+- With settings flags and **no data**, only the settings change and no new version is saved
+  (`agentruntime secrets set live/stripe --label env=prod`). `--create` and `--update` need data.
+- If the save works and the settings step fails, the command says so on standard error and exits `1`:
+  the secret is saved. A left-out `--scope` means the workspace room for both steps.
+- With `--json` and settings flags, standard output is one object, `{"saved": {...}, "settings": {...}}`
+  (`saved` is `null` when nothing was saved, `settings` is `null` when the settings step failed).
+
 ## Scripting and coding agents
 
 - `--json` prints raw JSON; `--no-color` disables colors.
 - Exit codes: `0` success, `1` error or failed run, `2` usage error, `3` run is waiting for approval.
 - `approve` shows the approval gate and asks for confirmation; pass `--yes` in scripts.
+- `secrets history`, `deleted`, `restore`, `undelete`, `delete` and `set` with settings flags keep `--json` output valid
+  (one JSON document on standard output; errors go to standard error). No command shows a secret's value.
 - `secrets check --json` prints `{"items":[{"ref":...,"resolves":...}]}` and exits `1` when any reference does not
   resolve. `secrets run` passes the command's exit code through. No `secrets` command prints a value to a
   non-terminal.
