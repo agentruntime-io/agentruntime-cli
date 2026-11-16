@@ -117,8 +117,14 @@ func newFakeServer(t *testing.T) *fakeServer {
 		return map[string]any{"outcome": "failed", "workflow_id": "wf-1", "run_id": "run-1",
 			"error": map[string]any{"message": "boom", "failure_code": "E_STEP", "failed_step_id": "s1"}}, false
 	})
-	add("vault_secret_read", "Read.", obj(map[string]any{}), func(map[string]any) (any, bool) {
+	add("vault_secrets_delete", "Delete.", obj(map[string]any{}), func(map[string]any) (any, bool) {
 		return map[string]any{"error": "risk group disabled"}, true
+	})
+	add("vault_secrets_list", "List.", obj(map[string]any{}), func(map[string]any) (any, bool) {
+		return map[string]any{"items": []any{map[string]any{"path": "live/stripe", "scope": "tenant", "keys": []any{"API_KEY"}}}}, false
+	})
+	add("vault_secrets_upsert", "Upsert.", obj(map[string]any{}), func(args map[string]any) (any, bool) {
+		return map[string]any{"path": args["path"], "version": 2}, false
 	})
 	add("pats_create", "Create.", obj(map[string]any{}), func(map[string]any) (any, bool) {
 		return map[string]any{"id": "pat-9", "token": "pat_new"}, false
@@ -252,7 +258,7 @@ func TestToolsListDescribeAndCall(t *testing.T) {
 	base := []string{"--url", srv.URL, "--pat", testToken}
 
 	_, out, _ := run(t, "", append(base, "tools", "list", "workflow")...)
-	if !strings.Contains(out, "workflow_run") || strings.Contains(out, "vault_secret_read") {
+	if !strings.Contains(out, "workflow_run") || strings.Contains(out, "vault_secrets_delete") {
 		t.Errorf("filter not applied:\n%s", out)
 	}
 
@@ -283,7 +289,7 @@ func TestToolsListDescribeAndCall(t *testing.T) {
 func TestToolErrorsSurfaceMessage(t *testing.T) {
 	isolate(t)
 	srv := newFakeServer(t)
-	code, _, errOut := run(t, "", "--url", srv.URL, "--pat", testToken, "vault", "read", "a/b")
+	code, _, errOut := run(t, "", "--url", srv.URL, "--pat", testToken, "vault", "delete", "a/b", "--yes")
 	if code != 1 || !strings.Contains(errOut, "risk group disabled") {
 		t.Errorf("code=%d err=%q", code, errOut)
 	}

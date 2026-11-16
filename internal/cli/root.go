@@ -62,6 +62,11 @@ type App struct {
 	client   *mcpclient.Client
 	stdout   render.Style
 	stderr   render.Style
+
+	// Test seams. isTTYOut overrides the "is standard output a terminal" check and
+	// signalSource replaces the OS signal channel while `secrets run` waits.
+	isTTYOut     func() bool
+	signalSource <-chan os.Signal
 }
 
 // NewApp creates an App bound to the given streams.
@@ -112,7 +117,7 @@ func (a *App) Root() *cobra.Command {
 		Short: "AgentRuntime CLI — drive the Platform MCP from your terminal",
 		Long: `agentruntime is a command-line client for AgentRuntime Platform MCP
 (https://mcp.agentruntime.io/mcp). Run workflows, approve human tasks, browse the
-connector catalog, manage tenant data, vault secrets and PATs — or call any
+connector catalog, manage tenant data, secrets and PATs — or call any
 Platform MCP tool directly with "agentruntime tools call".
 
 Get started:
@@ -120,6 +125,9 @@ Get started:
   agentruntime whoami         # confirm workspace and projects
   agentruntime workflows list
   agentruntime run <workflow-id> --wait
+
+Use a secret in a script without a .env file:
+  agentruntime secrets run --env KEY=workspace/live/stripe#API_KEY -- python job.py
 
 Configuration precedence: flags > environment (AGENTRUNTIME_PAT,
 AGENTRUNTIME_MCP_URL, AGENTRUNTIME_PROFILE) > saved profile > defaults.`,
@@ -147,7 +155,7 @@ AGENTRUNTIME_MCP_URL, AGENTRUNTIME_PROFILE) > saved profile > defaults.`,
 		a.toolsCmd(), a.callCmd(),
 		a.workflowsCmd(), a.runCmd(), a.awaitCmd(), a.inspectCmd(), a.approveCmd(true), a.approveCmd(false),
 		a.runsCmd(), a.tasksCmd(),
-		a.catalogCmd(), a.tenantDataCmd(), a.vaultCmd(), a.patsCmd(), a.analyticsCmd(), a.projectsCmd(),
+		a.catalogCmd(), a.tenantDataCmd(), a.secretsCmd(), a.patsCmd(), a.analyticsCmd(), a.projectsCmd(),
 		a.upgradeCmd(), a.versionCmd(),
 	)
 	return root
