@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -71,10 +72,11 @@ func (a *App) confirm(prompt string) (bool, error) {
 
 func (a *App) loginCmd() *cobra.Command {
 	var token string
-	var withToken, noVerify bool
+	var withToken, noVerify, device bool
+	var dev deviceFlags
 	cmd := &cobra.Command{
 		Use:   "login",
-		Short: "Save a personal access token (PAT) for this profile",
+		Short: "Save a personal access token (PAT) for this profile, or sign in with a code (--device)",
 		Long: `Stores a PAT (and optionally a custom MCP URL) in the CLI config and makes the
 profile current. Create a PAT in the Console under Settings → API tokens.
 
@@ -82,11 +84,30 @@ profile current. Create a PAT in the Console under Settings → API tokens.
   agentruntime login --token pat_xxx          # non-interactive
   echo $PAT | agentruntime login --with-token # from stdin (CI)
   agentruntime login --profile dev --url http://127.0.0.1:8340/mcp
+  agentruntime login --device --ref 'workspace/live/*'   # sign in with a code, see below
 
 The token is stored in the config file with owner-only permissions. In CI prefer
-the AGENTRUNTIME_PAT environment variable and skip login entirely.`,
+the AGENTRUNTIME_PAT environment variable and skip login entirely.
+
+--device signs in without pasting a key: the CLI prints a code, you approve it in
+the Console, and a short-lived key that can only fetch secrets is saved in the
+profile.
+
+` + deviceLoginLong,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if device {
+				if token != "" || withToken || noVerify {
+					return &ExitErr{Code: ExitUsage, Err: errors.New("--device cannot be combined with --token, --with-token or --no-verify")}
+				}
+				dev.deviceNameSet = cmd.Flags().Changed("device-name")
+				return a.loginDevice(cmd, dev)
+			}
+			for _, name := range deviceOnlyFlags {
+				if cmd.Flags().Changed(name) {
+					return &ExitErr{Code: ExitUsage, Err: fmt.Errorf("--%s only works with --device", name)}
+				}
+			}
 			if err := a.loadConfig(); err != nil {
 				return err
 			}
@@ -153,6 +174,7 @@ the AGENTRUNTIME_PAT environment variable and skip login entirely.`,
 			}
 			prof.Token = token
 			prof.ExpiresAt = "" // a key pasted here has no stored expiry; an old one belonged to the key it replaces
+			prof.IssuedByHost = ""
 			if strings.TrimSpace(a.flags.url) != "" || prof.URL == "" {
 				prof.URL = url
 			}
@@ -168,6 +190,8 @@ the AGENTRUNTIME_PAT environment variable and skip login entirely.`,
 	cmd.Flags().StringVar(&token, "token", "", "PAT to store (omit for a hidden prompt)")
 	cmd.Flags().BoolVar(&withToken, "with-token", false, "read the PAT from stdin")
 	cmd.Flags().BoolVar(&noVerify, "no-verify", false, "save without checking the token against the server")
+	cmd.Flags().BoolVar(&device, "device", false, "sign in with a code you approve in the Console; saves a short-lived key that can only fetch secrets")
+	addDeviceFlags(cmd, &dev)
 	return cmd
 }
 
@@ -189,6 +213,7 @@ func (a *App) logoutCmd() *cobra.Command {
 				if p := a.cfg.Profiles[n]; p != nil {
 					p.Token = ""
 					p.ExpiresAt = ""
+					p.IssuedByHost = ""
 					fmt.Fprintf(a.Out, "Removed token for profile %q\n", n)
 				}
 			}
@@ -272,6 +297,22 @@ func (a *App) statusCmd() *cobra.Command {
 	}
 }
 
+// tokenColumn is what `profile list` shows for a profile's key. A short-lived key (one with a stored expiry) shows no
+// character of the key at all, only when it ends; any other key is shown shortened, as before.
+func (a *App) tokenColumn(p *config.Profile) string {
+	if p.Token == "" || p.ExpiresAt == "" {
+		return config.MaskToken(p.Token)
+	}
+	exp, err := time.Parse(time.RFC3339, strings.TrimSpace(p.ExpiresAt))
+	switch {
+	case err != nil:
+		return "short-lived key"
+	case !a.nowTime().Before(exp):
+		return "short-lived key (expired)"
+	}
+	return "short-lived key (until " + formatLocal(exp) + ")"
+}
+
 func (a *App) profileCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "profile",
@@ -292,7 +333,14 @@ func (a *App) profileCmd() *cobra.Command {
 					out := []map[string]any{}
 					for _, n := range a.cfg.Names() {
 						p := a.cfg.Profiles[n]
-						out = append(out, map[string]any{"name": n, "url": p.URL, "has_token": p.Token != "", "current": n == cur})
+						row := map[string]any{"name": n, "url": p.URL, "has_token": p.Token != "", "current": n == cur}
+						if p.Token != "" && p.ExpiresAt != "" {
+							row["expires_at"] = p.ExpiresAt
+						}
+						if p.Token != "" && p.IssuedByHost != "" {
+							row["issued_by_host"] = p.IssuedByHost
+						}
+						out = append(out, row)
 					}
 					return render.JSON(a.Out, out)
 				}
@@ -311,7 +359,7 @@ func (a *App) profileCmd() *cobra.Command {
 					if url == "" {
 						url = config.DefaultURL
 					}
-					rows = append(rows, []string{mark, n, url, config.MaskToken(p.Token)})
+					rows = append(rows, []string{mark, n, url, a.tokenColumn(p)})
 				}
 				render.Table(a.Out, a.stdout, []string{"", "profile", "url", "token"}, rows, 60)
 				return nil

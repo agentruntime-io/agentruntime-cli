@@ -38,6 +38,8 @@ go build -o agentruntime .
 
 ```sh
 agentruntime login                 # paste a personal access token (PAT)
+# or sign in with a code you approve in the Console (a short-lived key that can only fetch secrets):
+# agentruntime login --device --ref 'workspace/live/*'
 agentruntime whoami                # confirm workspace and projects
 agentruntime workflows list
 agentruntime run <workflow-id> --wait
@@ -47,7 +49,7 @@ agentruntime run <workflow-id> --wait
 
 | Area | Commands |
 |---|---|
-| Auth and config | `login`, `logout`, `whoami`, `status`, `profile` |
+| Auth and config | `login` (`--device` signs in with a code), `logout`, `whoami`, `status`, `profile` |
 | Workflows | `run`, `await`, `inspect`, `approve`, `reject`, `workflows`, `runs`, `tasks` |
 | Raw tools | `tools list`, `tools describe`, `tools call` (alias: `call`) |
 | Platform | `catalog`, `tenantdata`, `secrets` (alias `vault`), `pats`, `analytics`, `projects` |
@@ -64,7 +66,7 @@ Precedence: flags > environment > saved profile > defaults.
 | Token | `--pat` | `AGENTRUNTIME_PAT` |
 | Endpoint | `--url` | `AGENTRUNTIME_MCP_URL` |
 | Profile | `--profile` | `AGENTRUNTIME_PROFILE` |
-| API address (`secrets run`, `check`, `get`, `render`, `handover`, history and the rest) | `--api-url` | `AGENTRUNTIME_API_URL` |
+| API address (`secrets run`, `check`, `get`, `render`, `handover`, history and the rest, and `login --device`) | `--api-url` | `AGENTRUNTIME_API_URL` |
 
 Profiles are stored per user in `agentruntime/config.json` under your OS config directory (owner-only
 permissions). Use `agentruntime profile list|use|remove` to manage them.
@@ -306,10 +308,111 @@ stripe_key   = {{ secret "workspace/live/stripe#API_KEY" | quote }}
   engine's own messages can quote a secret's value (ranging over a string prints it), and a masker
   cannot take out a value of one or two characters, so none of the engine's text is shown.
 
+## Sign in with a code
+
+`login --device` signs you in without pasting a key: on a laptop, on a server you reached over SSH, or
+anywhere you would rather not keep a long-lived key. The CLI prints a short code and an address. You open
+the address in a browser, sign in to the Console, check what the terminal is asking for, narrow it if you
+like, and approve it. The CLI then saves a **short-lived access key** in a profile (the one you name with `--profile`,
+else the current one), together with
+the moment it stops working (`expires_at`, RFC 3339), and says so.
+
+> **Only run `login --device` yourself, only approve your own sign-ins, and check the workspace and the approver
+> it shows when it finishes** (`Approved for workspace ... by t***@example.com`). Someone who says "send me the code,
+> I will approve it" approves from *their* account, and `secrets run` would then use values from *their* workspace,
+> which could change how a program runs. The first line it prints is the API host it talks to.
+
+```sh
+agentruntime login --device --ref 'workspace/live/*'
+agentruntime login --device --ref workspace/live/stripe --ref my/deploy --ttl 4h --profile laptop
+agentruntime login --device --all --scope vault:read --open
+```
+
+```
+API: api.agentruntime.io
+To sign in, open this address in a browser (on any device) and enter the code:
+
+  https://console.example.com/device
+  code: BCDF-2345
+
+or open this address, which has the code in it:
+  https://console.example.com/device?code=BCDF-2345
+
+This asks for: fetching workspace/live/*, for up to 1h (the approver may narrow this)
+Device: my-laptop
+Approve it only if you started this from your own terminal just now.
+The code works for 10m. Waiting for approval (Ctrl-C to cancel)...
+✔ signed in until 2026-11-16 17:04 UTC (in 59 minutes); fetch only
+  Approved for workspace Acme by t***@example.com
+  Check that this is your workspace and your own account: secrets fetched with this key come from that workspace.
+  Scopes: secrets:fetch
+  Secrets it may fetch: workspace/live/*
+```
+
+- **You say which secrets the key may fetch**: one `--ref` for each secret or folder (`workspace/live/stripe`,
+  `workspace/live/*`, `my/*`; the room is `my`, `project` or `workspace`, a `*` may only be the whole last
+  part, no `#field`), at most 100, or `--all` for everything the approver may view. A name without a room,
+  `shared/`, `..` and invisible characters are refused before anything is sent. The person approving can
+  **narrow** the request (fewer secrets, a shorter time, fewer scopes) and never widen it; the CLI shows what
+  was granted.
+- **The key can only fetch secrets.** It carries the scope `secrets:fetch`, always; `--scope vault:read` adds
+  listing secret names. So it is "fetch only": `secrets run`, `get`, `check` and `render` work, commands that
+  need more rights (`whoami`, `workflows`) may be refused. It stops working after `--ttl` (1 minute to 8 hours,
+  default 1 hour); a person can revoke it earlier in the Console under Settings, API keys, Short-lived access.
+  The workspace's fetch switch and the owner's rights are checked on every use, as for any access key.
+- **Approve a code only if you started it from your own terminal just now.** The code is not a secret, but
+  approving someone else's code would give them access. The CLI prints the code and the address even when its
+  output is piped (so a coding agent can show them to you); it opens a browser only with `--open`, and then only
+  an `https` address on the API's own domain (a different domain is shown with a warning and never opened).
+- **Which server.** `login --device` always prints `API: <host>` first. An `agentruntime.io` host (or `localhost`,
+  `127.0.0.1`, `::1`) is used as it is. For any other host, whether it comes from `--api-url`, `AGENTRUNTIME_API_URL`
+  or the Platform MCP address, it prints a loud warning and asks you to **type the host name** before anything is
+  sent; without a terminal it refuses unless you pass `--yes`. `--open` is refused for such a host. That server decides
+  which page you are shown and which key you get. The key is saved with the host that issued it (`issued_by_host` in
+  the profile). **Every command that sends the saved key to a server (the API commands and the Platform MCP
+  commands) refuses to send it to a host other than the one that issued it** unless you pass `--yes`, and then it
+  prints a warning and sends it. A flag, `AGENTRUNTIME_API_URL` or `AGENTRUNTIME_MCP_URL` that points somewhere
+  else is how that happens by mistake. A key given with `--pat` or `AGENTRUNTIME_PAT`, and commands that send
+  nothing (`profile`, `logout`, `version`), are not affected. A host name must be **plain ASCII** (letters,
+  digits, `.`, `-`; write an international name in its `xn--` form): any other character is refused, because some
+  (the dotted capital I, the Kelvin sign) look like, or case-fold to, ASCII letters, so a lookalike could pass
+  for an AgentRuntime host. Only `agentruntime.io` and the names under it count as AgentRuntime hosts. The host
+  printed on the first line, stored in the profile, compared and dialled is one and the same value.
+- **Who approved.** When it finishes it prints `Approved for workspace <name> by <masked approver>` from what the server
+  sends (the workspace id when there is no name). Check it: the key fetches from that workspace.
+- **Waiting.** The CLI polls at the interval the server gives (default 5 seconds), waits longer when the server
+  says `slow_down`, retries a failed poll a few times, and stops when the code's lifetime (10 minutes) is over.
+  `Ctrl-C` cancels and nothing is saved. The default `--timeout` does not apply to the wait; a `--timeout` you
+  give does. A denied or expired code is explained in plain words and saves nothing.
+- **The key is delivered exactly once** and is saved only in the config file (owner-only permissions on macOS and
+  Linux, written to a temp file and renamed so a failed save leaves the old config alone). **The CLI never prints
+  the key or the device code**, in any message, and `profile list` shows when a short-lived key ends instead of any
+  part of it. If the config cannot be written, that is found before the code is shown. `AGENTRUNTIME_PAT` in your
+  environment still overrides the saved key, and the CLI says so.
+- **The device name is your machine's host name** by default, and it is sent to the API so the approver can recognise
+  the terminal. `--device-name NAME` sends another name; `--device-name ""` sends a generic one (`AgentRuntime CLI`)
+  instead of the host name.
+- **It will not replace a key that does not expire by accident.** A profile that holds a key with no expiry (one
+  you pasted) makes the command refuse, because the new key can only fetch secrets: use `--profile NAME` to keep
+  both, or `--replace` to replace it. A key from an earlier sign-in (it has an expiry) is renewed without asking.
+  `--replace` says that the old key was removed from the profile; it is not revoked on the server, so revoke it in
+  the Console if you no longer need it. `logout` removes the saved key from the profile; it does not revoke it, so revoke a key you no longer trust in the
+  Console.
+- **The profile is not made current.** The CLI saves the key into the profile you named with `--profile` (or the
+  current one) and leaves the current profile alone, so `whoami` and `workflows` keep using your normal key. Use
+  `--profile NAME` (or `AGENTRUNTIME_PROFILE`) to use the fetch-only key. The config is read again just before the key
+  is saved, so a profile changed in another terminal while you waited is not overwritten, and a key that does not
+  expire that appeared there meanwhile is not replaced without `--replace`. The expiry the server reports is limited to
+  8 hours from now (a later one is cut back, with a note).
+- Like every call the CLI makes with a key, these two calls need an `https` API address (plain `http` only for
+  `localhost`, `127.0.0.1` and `::1`), never follow a redirect, cap the size of an answer and time out. They carry no
+  access key. The API address comes from `--api-url`, `AGENTRUNTIME_API_URL` or the Platform MCP address, as for
+  the other commands, and is not saved in the profile.
+
 ## Short-lived keys
 
 Some access keys are short-lived: a one-time key from `secrets handover`, or a key that a sign-in made
-for a few hours. When the key in use has under 10 minutes left, `run`, `check`, `get` and `render` say
+for a few hours (`login --device` saves it in the profile with its `expires_at`). When the key in use has under 10 minutes left, `run`, `check`, `get` and `render` say
 so on standard error (`note: this key expires in 7 minutes`); the server reports the expiry in the
 `X-Key-Expires` header of its answer. A key that does not expire is never mentioned. If a key saved in a
 profile has an expiry that has passed and the server answers `401`, the CLI says "your short-lived key
@@ -399,6 +502,9 @@ read-only: use the room it really lives in. Every command takes `--json` and `--
   non-terminal. `secrets render --output PATH` prints one JSON summary with `--json`
   (`{"written":...,"replaced":...,"bytes":...,"references":...}`, no value). `secrets handover` refuses to run when
   standard output is not a terminal, with or without `--json`; on a terminal `--json` includes the token.
+- `login --device` prints the code and the address on standard output even when it is piped (the code is not a secret), never
+  the key or the device code, and ignores `--json`. Exit codes: `0` signed in, `1` denied, expired, or failed, `2` bad flags,
+  `130` Ctrl-C. Nothing is saved unless it ends with `0`.
 
 ## License
 

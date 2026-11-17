@@ -107,10 +107,19 @@ func (a *App) secretsHandoverCmd() *cobra.Command {
 // parseHandoverTTL reads --ttl: a whole number with a unit s, m, h or d (90s, 15m, 1h, 1d), or a Go duration such
 // as 1h30m, from one minute to 24 hours.
 func parseHandoverTTL(s string) (int, error) {
-	bad := fmt.Errorf("--ttl must be from 1m to 24h, for example 15m, 1h or 24h (got %q)", s)
+	if secs, ok := parseSpanSeconds(s, bffclient.MinHandoverTTLSeconds, bffclient.MaxHandoverTTLSeconds); ok {
+		return secs, nil
+	}
+	return 0, fmt.Errorf("--ttl must be from 1m to 24h, for example 15m, 1h or 24h (got %q)", s)
+}
+
+// parseSpanSeconds reads a lifetime: a whole number with a unit s, m, h or d (90s, 15m, 1h, 1d), or a Go duration
+// such as 1h30m. ok is false when it cannot be read, is not a whole number of seconds, or is outside lo to hi
+// seconds.
+func parseSpanSeconds(s string, lo, hi int) (secs int, ok bool) {
 	t := strings.ToLower(strings.TrimSpace(s))
 	if t == "" {
-		return 0, bad
+		return 0, false
 	}
 	var d time.Duration
 	if unit := map[byte]time.Duration{'s': time.Second, 'm': time.Minute, 'h': time.Hour, 'd': 24 * time.Hour}[t[len(t)-1]]; unit != 0 {
@@ -121,13 +130,13 @@ func parseHandoverTTL(s string) (int, error) {
 	if d == 0 {
 		var err error
 		if d, err = time.ParseDuration(t); err != nil {
-			return 0, bad
+			return 0, false
 		}
 	}
-	if d%time.Second != 0 || d < bffclient.MinHandoverTTLSeconds*time.Second || d > bffclient.MaxHandoverTTLSeconds*time.Second {
-		return 0, bad
+	if d%time.Second != 0 || d < time.Duration(lo)*time.Second || d > time.Duration(hi)*time.Second {
+		return 0, false
 	}
-	return int(d / time.Second), nil
+	return int(d / time.Second), true
 }
 
 // checkHandoverAnswer makes sure the key the server made is the one that was asked for, before the token is shown.

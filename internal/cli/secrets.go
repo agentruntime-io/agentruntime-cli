@@ -273,6 +273,25 @@ func (a *App) apiClient(apiURL string) (*bffclient.Client, error) {
 	if a.resolved.Token == "" {
 		return nil, &ExitErr{Code: ExitError, Err: errors.New("not logged in: run `agentruntime login` or set AGENTRUNTIME_PAT")}
 	}
+	base, err := a.apiBase(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	c, err := bffclient.New(base, a.resolved.Token)
+	if err != nil {
+		return nil, &ExitErr{Code: ExitError, Err: err}
+	}
+	// The key goes only to the host that issued it (unless --yes): the client's own authority is the one value that is
+	// dialled and compared.
+	if err := a.checkKeyHost(c.Authority(), c.Authority()); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// apiBase is the API address: --api-url, else the environment, else derived from the Platform MCP address. The
+// config must be loaded.
+func (a *App) apiBase(apiURL string) (string, error) {
 	base := strings.TrimSpace(apiURL)
 	if base == "" {
 		base = strings.TrimSpace(os.Getenv(bffclient.EnvAPIURL))
@@ -280,15 +299,11 @@ func (a *App) apiClient(apiURL string) (*bffclient.Client, error) {
 	if base == "" {
 		d, err := bffclient.DeriveAPIURL(a.resolved.URL)
 		if err != nil {
-			return nil, &ExitErr{Code: ExitError, Err: fmt.Errorf("%w; pass --api-url or set %s", err, bffclient.EnvAPIURL)}
+			return "", &ExitErr{Code: ExitError, Err: fmt.Errorf("%w; pass --api-url or set %s", err, bffclient.EnvAPIURL)}
 		}
 		base = d
 	}
-	c, err := bffclient.New(base, a.resolved.Token)
-	if err != nil {
-		return nil, &ExitErr{Code: ExitError, Err: err}
-	}
-	return c, nil
+	return base, nil
 }
 
 // explainAPI turns a client error into a CLI error. Server answers carry a fixed

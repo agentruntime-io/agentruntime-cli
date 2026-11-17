@@ -48,6 +48,7 @@ type globalFlags struct {
 	json    bool
 	noColor bool
 	timeout time.Duration
+	yes     bool // the global --yes (or the --yes of the command that has its own): say yes to what would be asked or refused
 }
 
 // App holds IO and lazily-created connection state shared by all commands.
@@ -68,6 +69,14 @@ type App struct {
 	isTTYOut     func() bool
 	signalSource <-chan os.Signal
 	now          func() time.Time // the clock; nil means time.Now
+	// sleep replaces the wait between polls of `login --device`; openURL replaces the browser opener.
+	sleep   func(ctx context.Context, d time.Duration) error
+	openURL func(address string) error
+	// hostTrusted replaces the rule for which API hosts need no confirmation (the loopback hosts are never a real server
+	// in a test of the confirmation).
+	hostTrusted func(host string) bool
+
+	warnedKeyHost bool // the warning about a key issued by another host was printed
 }
 
 // nowTime is the current time, from the test clock when one is set.
@@ -153,10 +162,15 @@ AGENTRUNTIME_MCP_URL, AGENTRUNTIME_PROFILE) > saved profile > defaults.`,
 	pf.BoolVar(&a.flags.json, "json", false, "print raw JSON instead of formatted output")
 	pf.BoolVar(&a.flags.noColor, "no-color", false, "disable coloured output")
 	pf.DurationVar(&a.flags.timeout, "timeout", defaultTimout, "overall timeout for the command")
+	pf.BoolVar(&a.flags.yes, "yes", false, "say yes to what a command would ask, and send a saved short-lived key to a host other than the one that issued it (refused without this)")
 
 	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
 		a.stdout = render.NewStyle(a.Out, a.flags.noColor)
 		a.stderr = render.NewStyle(a.Err, a.flags.noColor)
+		// A command with its own --yes (approve, delete, ...) shadows the global one: read whichever this command has.
+		if f := cmd.Flags().Lookup("yes"); f != nil && f.Value.String() == "true" {
+			a.flags.yes = true
+		}
 	}
 
 	root.AddCommand(
@@ -207,6 +221,9 @@ func (a *App) connect(ctx context.Context) (*mcpclient.Client, error) {
 	}
 	if a.resolved.Token == "" && !isLocalURL(a.resolved.URL) {
 		return nil, &ExitErr{Code: ExitError, Err: errors.New("not logged in: run `agentruntime login` or set AGENTRUNTIME_PAT")}
+	}
+	if err := a.checkKeyHostForMCP(); err != nil {
+		return nil, err
 	}
 	c, err := mcpclient.Connect(ctx, a.resolved.URL, a.resolved.Token)
 	if err != nil {

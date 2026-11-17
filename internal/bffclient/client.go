@@ -22,6 +22,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/agentruntime-io/agentruntime-cli/internal/apihost"
 	"github.com/agentruntime-io/agentruntime-cli/internal/version"
 )
 
@@ -105,6 +106,9 @@ type Client struct {
 // BaseURL is the API address the client calls, without a trailing slash.
 func (c *Client) BaseURL() string { return c.base.String() }
 
+// Authority is the host the client dials, as it is shown, stored and compared (see package apihost).
+func (c *Client) Authority() string { return apihost.Authority(c.base) }
+
 // KeyExpires returns when the access key stops working, as reported by the last fetch or check answer. ok is false
 // when no answer carried an expiry (the key does not expire, or the server did not say).
 func (c *Client) KeyExpires() (t time.Time, ok bool) {
@@ -133,26 +137,13 @@ func (c *Client) noteKeyExpiry(h http.Header) {
 // (plain http is accepted only for the exact hosts localhost, 127.0.0.1 and ::1,
 // for local testing).
 func New(base, token string) (*Client, error) {
-	u, err := url.Parse(strings.TrimSpace(base))
-	if err != nil || u.Host == "" {
-		return nil, errors.New("the API address is not a valid URL")
-	}
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, errors.New("the API address must not carry credentials, a query or a fragment")
-	}
-	switch u.Scheme {
-	case "https":
-	case "http":
-		if !isLoopback(u.Hostname()) {
-			return nil, errors.New("refusing to send an access key over plain http: use an https API address (http is allowed only for localhost, 127.0.0.1 and ::1)")
-		}
-	default:
-		return nil, errors.New("the API address must start with https://")
+	u, err := parseBase(base, "refusing to send an access key over plain http: use an https API address (http is allowed only for localhost, 127.0.0.1 and ::1)")
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(token) == "" {
 		return nil, errors.New("no access key configured")
 	}
-	u.Path = strings.TrimRight(u.Path, "/")
 	return &Client{
 		base:  u,
 		token: strings.TrimSpace(token),
@@ -161,6 +152,37 @@ func New(base, token string) (*Client, error) {
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
 	}, nil
+}
+
+// parseBase validates an API address for every client in this package: https, or plain http only for the exact
+// loopback hosts; no credentials, query or fragment. plainHTTP is the sentence used for a refused http address.
+func parseBase(base, plainHTTP string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || u.Host == "" {
+		return nil, errors.New("the API address is not a valid URL")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("the API address must not carry credentials, a query or a fragment")
+	}
+	// The name that is dialled must be the name that is shown, stored and compared. A host with characters outside
+	// ASCII is dialled in another form (its punycode), and some of those characters look like, or case-fold to, ASCII
+	// letters, so it is refused: write an international name in its xn-- form.
+	if !apihost.ASCII(u.Hostname()) {
+		return nil, errors.New("the API address must use a plain ASCII host name (write an international name in its xn-- form), so that the name shown is the name dialled")
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !isLoopback(u.Hostname()) {
+			return nil, errors.New(plainHTTP)
+		}
+	default:
+		return nil, errors.New("the API address must start with https://")
+	}
+	// One lower-case ASCII form of the host, used for the request and for everything that is shown or compared.
+	u.Host = apihost.Fold(u.Host)
+	u.Path = strings.TrimRight(u.Path, "/")
+	return u, nil
 }
 
 // isLoopback reports whether host is exactly one of the three loopback names that
@@ -277,7 +299,14 @@ type reply struct {
 // send makes one authenticated request and reads the answer. A JSON payload is sent when it is not nil; query
 // is added to the URL. Redirects are never followed. Errors carry the address, never a header or a body.
 func (c *Client) send(ctx context.Context, method, path string, query url.Values, payload []byte) (*reply, error) {
-	u := *c.base
+	return doRequest(ctx, c.http, c.base, c.token, maxAnswerBytes, method, path, query, payload)
+}
+
+// doRequest is the one place a request is made and its answer read, for the client that holds an access key and the
+// one that does not. bearer is sent as the Authorization header unless it is empty. The answer is read up to
+// maxBytes and no further.
+func doRequest(ctx context.Context, hc *http.Client, base *url.URL, bearer string, maxBytes int, method, path string, query url.Values, payload []byte) (*reply, error) {
+	u := *base
 	u.Path += path
 	u.RawQuery = query.Encode()
 	var body io.Reader
@@ -288,25 +317,27 @@ func (c *Client) send(ctx context.Context, method, path string, query url.Values
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", version.UserAgent())
 
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		// url.Error prints the URL, never a header or a body.
-		return nil, fmt.Errorf("cannot reach the API at %s: %w", c.base.Redacted(), unwrapURLError(err))
+		return nil, fmt.Errorf("cannot reach the API at %s: %w", base.Redacted(), unwrapURLError(err))
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswerBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)+1))
 	if err != nil {
 		return nil, errors.New("could not read the answer from the server")
 	}
-	if len(raw) > maxAnswerBytes {
+	if len(raw) > maxBytes {
 		return nil, errors.New("the answer from the server is larger than expected; nothing was used")
 	}
 	return &reply{Status: resp.StatusCode, Header: resp.Header, Body: raw}, nil
@@ -325,13 +356,17 @@ func unwrapURLError(err error) error {
 func apiError(status int, header http.Header, body []byte, fallbacks fallbackSet) *APIError {
 	e := &APIError{Status: status}
 	var ans struct {
-		Error   string   `json:"error"`
-		Message string   `json:"message"`
-		Rooms   []string `json:"rooms"`
+		Error       string   `json:"error"`
+		Message     string   `json:"message"`
+		Description string   `json:"error_description"` // the RFC 8628 spelling, used by the device routes
+		Rooms       []string `json:"rooms"`
 	}
 	if json.Unmarshal(body, &ans) == nil {
 		e.Code = cleanText(ans.Error, 40)
 		e.Message = cleanText(ans.Message, 300)
+		if e.Message == "" {
+			e.Message = cleanText(ans.Description, 300)
+		}
 		for _, r := range ans.Rooms {
 			switch r {
 			case "my", "project", "workspace":

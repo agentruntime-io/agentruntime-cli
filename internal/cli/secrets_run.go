@@ -108,6 +108,12 @@ command line, and never written to disk unless you ask for --secret-file.
 
 Each field you name is one reference, and one call carries at most 20.
 
+The values come from the workspace the access key belongs to. For a key made by
+agentruntime login --device that is the workspace that APPROVED the sign-in, shown
+when you signed in: not necessarily yours. Only run login --device yourself, and
+only approve your own sign-ins, because a value from someone else's workspace (one you
+map to PATH or NODE_OPTIONS, say) would change how the command runs.
+
 Put -- before the command. An explicit --env wins over a variable from
 --env-from. Variables replace the ones already in the environment.
 

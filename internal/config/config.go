@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/agentruntime-io/agentruntime-cli/internal/apihost"
 )
 
 const (
@@ -27,6 +29,10 @@ type Profile struct {
 	// ExpiresAt is when a short-lived key stored in Token stops working (RFC 3339). It is empty for a key that
 	// does not expire. Whoever saves a short-lived key writes it, and whoever replaces or removes the key clears it.
 	ExpiresAt string `json:"expires_at,omitempty"`
+	// IssuedByHost is the API host (host name, and port when it is not the default) that issued the short-lived key in
+	// Token, written by `login --device`. Other commands warn when they would send the key to a different host. It is
+	// empty for a key that was pasted. Whoever replaces or removes the key clears it.
+	IssuedByHost string `json:"issued_by_host,omitempty"`
 }
 
 // File is the on-disk config document.
@@ -91,11 +97,53 @@ func (f *File) Save() error {
 	if err != nil {
 		return err
 	}
+	// The new content goes to a file of its own, created owner-only, and is renamed over the old one, so a reader
+	// sees the old config or the whole new one. A temp file left by an earlier crash is removed first: writing
+	// into it would keep its permissions, which may be wider than 0600.
 	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	_ = os.Remove(tmp)
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	if _, err := out.Write(append(data, '\n')); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// CheckWritable reports whether the config file can be saved, without touching it: it makes the config folder if
+// needed and creates and removes a temp file beside the config. A flow that receives a key that is shown only once
+// calls it first, so a folder that cannot be written is found before the person is asked to approve anything.
+func CheckWritable() error {
+	p, err := Path()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("cannot write the config folder: %w", err)
+	}
+	probe, err := os.CreateTemp(dir, ".write-check-*")
+	if err != nil {
+		return fmt.Errorf("cannot write the config folder: %w", err)
+	}
+	name := probe.Name()
+	_ = probe.Close()
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("cannot write the config folder: %w", err)
+	}
+	return nil
 }
 
 // Names returns the saved profile names, sorted.
@@ -125,6 +173,8 @@ type Resolved struct {
 	// TokenExpiresAt is the expiry stored with the profile's key. It is set only when the key in use comes from
 	// the saved profile: a key given by flag or environment is not the one the profile's expiry belongs to.
 	TokenExpiresAt time.Time
+	// TokenIssuedByHost is the host that issued the profile's key, under the same rule as TokenExpiresAt.
+	TokenIssuedByHost string
 }
 
 func firstEnv(keys ...string) (string, string) {
@@ -180,6 +230,7 @@ func (f *File) Resolve(o Overrides) Resolved {
 			if t, err := time.Parse(time.RFC3339, strings.TrimSpace(prof.ExpiresAt)); err == nil {
 				r.TokenExpiresAt = t
 			}
+			r.TokenIssuedByHost = apihost.Fold(strings.TrimSpace(prof.IssuedByHost))
 		}
 	}
 	return r
