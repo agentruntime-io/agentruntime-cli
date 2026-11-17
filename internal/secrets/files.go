@@ -163,6 +163,54 @@ func WriteOwnerOnly(path string, data []byte) error {
 	return nil
 }
 
+// renameFile moves the finished temporary file into place. It is a variable so a test can look at the state just
+// before the move, and make the move fail.
+var renameFile = os.Rename
+
+// ReplaceOwnerOnly writes data to path with owner-only permissions (0600; on Windows the file keeps the inherited
+// ACL), replacing a regular file that is already there. It never edits the old file in place: the content goes into
+// a new owner-only file in the same folder, which is then renamed over path, so a reader sees the old file or the
+// whole new one and never a mix, and a failure at any point leaves the old file as it was. The new file does not
+// inherit the old file's permissions. Anything at path that is not a regular file (a folder, a link, a device) is
+// refused: a rename would replace a link itself, not the file behind it, and that is never what is wanted.
+func ReplaceOwnerOnly(path string, data []byte) error {
+	if st, err := os.Lstat(path); err == nil && !st.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file; refusing to replace it", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	base := filepath.Base(path)
+	if len(base) > 40 {
+		base = base[:40]
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), "."+base+".*.tmp") // created 0600
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	done := false
+	defer func() {
+		if !done {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := renameFile(tmp, path); err != nil {
+		return fmt.Errorf("could not replace %s (it was left as it was): %w", path, err)
+	}
+	done = true
+	return nil
+}
+
 // Files tracks the secret files a run has written so they can all be removed
 // when the command ends.
 type Files struct {

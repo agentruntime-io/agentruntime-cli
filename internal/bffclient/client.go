@@ -18,6 +18,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 
 	"github.com/agentruntime-io/agentruntime-cli/internal/version"
@@ -34,6 +36,10 @@ const (
 	maxAnswerBytes = 256 * 1024
 
 	fetchPath = "/v1/secrets/fetch"
+
+	// KeyExpiresHeader is the response header on the fetch route (check mode included) that carries the moment the
+	// access key stops working, in RFC 3339. The server sends it only for a key that has an expiry.
+	KeyExpiresHeader = "X-Key-Expires"
 )
 
 // DeriveAPIURL turns the Platform MCP URL into the API base URL: the "mcp."
@@ -91,6 +97,35 @@ type Client struct {
 	base  *url.URL
 	token string
 	http  *http.Client
+
+	mu         sync.Mutex
+	keyExpires time.Time // from the last fetch or check answer that carried KeyExpiresHeader
+}
+
+// BaseURL is the API address the client calls, without a trailing slash.
+func (c *Client) BaseURL() string { return c.base.String() }
+
+// KeyExpires returns when the access key stops working, as reported by the last fetch or check answer. ok is false
+// when no answer carried an expiry (the key does not expire, or the server did not say).
+func (c *Client) KeyExpires() (t time.Time, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.keyExpires, !c.keyExpires.IsZero()
+}
+
+// noteKeyExpiry remembers the expiry a fetch or check answer reports. An unreadable value is ignored.
+func (c *Client) noteKeyExpiry(h http.Header) {
+	v := strings.TrimSpace(h.Get(KeyExpiresHeader))
+	if v == "" {
+		return
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return
+	}
+	c.mu.Lock()
+	c.keyExpires = t
+	c.mu.Unlock()
 }
 
 // New validates the base URL and builds a client. The access key travels in a
@@ -226,6 +261,7 @@ func (c *Client) post(ctx context.Context, refs []string, check bool) ([]byte, e
 		return nil, err
 	}
 	if reply.Status == http.StatusOK {
+		c.noteKeyExpiry(reply.Header)
 		return reply.Body, nil
 	}
 	return nil, apiError(reply.Status, reply.Header, reply.Body, fetchFallbacks)

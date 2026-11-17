@@ -64,7 +64,7 @@ Precedence: flags > environment > saved profile > defaults.
 | Token | `--pat` | `AGENTRUNTIME_PAT` |
 | Endpoint | `--url` | `AGENTRUNTIME_MCP_URL` |
 | Profile | `--profile` | `AGENTRUNTIME_PROFILE` |
-| API address (`secrets run`, `check`, `get`) | `--api-url` | `AGENTRUNTIME_API_URL` |
+| API address (`secrets run`, `check`, `get`, `render`, `handover`, history and the rest) | `--api-url` | `AGENTRUNTIME_API_URL` |
 
 Profiles are stored per user in `agentruntime/config.json` under your OS config directory (owner-only
 permissions). Use `agentruntime profile list|use|remove` to manage them.
@@ -84,6 +84,8 @@ agentruntime secrets check workspace/live/stripe#API_KEY
 agentruntime secrets get workspace/live/stripe#API_KEY --print                # terminal only
 agentruntime secrets history live/stripe --scope tenant                       # who changed it, never values
 agentruntime secrets deleted --scope tenant                                   # Recently deleted
+agentruntime secrets render app.conf.tmpl --output app.conf                   # fill a config file; it stays on disk
+agentruntime secrets handover workspace/live/stripe#API_KEY                   # a one-time key for someone else
 ```
 
 **References.** `[secret:]<room>/<path>[#<field>]`. The room is `my` (your own secrets),
@@ -178,6 +180,141 @@ value keeps its stored value; `--remove-key NAME` deletes a field). `--scope` na
 > The inline forms stay available for blank values (`-d field=` keeps the stored value with
 > `--update`) and for non-secret fields.
 
+## Hand over a secret once
+
+`secrets handover` gives one secret to one person (or one machine) without ever pasting the value into
+a chat or an email. It makes a **one-time access key**: it can fetch exactly this secret, exactly
+once, and stops working after `--ttl` (1 minute to 24 hours, default 1 hour), whichever comes first.
+You send the key (the way you would send a password); the person fetches the value with it.
+
+**What the key can fetch depends on the reference, and the server enforces it:** with `#FIELD` the key
+can fetch **only that one field** of the secret (not its other fields); without `#FIELD` it can fetch
+the **whole secret**, every field in it. The output says which of the two the token gives, and both
+usage lines carry the reference exactly as you gave it, `#FIELD` included.
+
+```sh
+agentruntime secrets handover workspace/live/stripe#API_KEY            # only the field API_KEY, valid for 1 hour
+agentruntime secrets handover workspace/live/stripe --ttl 15m          # the whole secret, 15 minutes
+```
+
+```
+One-time key for workspace/live/stripe#API_KEY
+It can fetch only the field API_KEY of that secret, and nothing else (not its other fields).
+It works once, then it stops. It is valid for 1h (until 2026-11-16T12:00:00Z), whichever ends first.
+Anyone who has it can read this value once. Do not paste it into an AI tool.
+
+pat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+To use it, put the key where <token> is (the reference is the one you gave, and the only one the key can fetch):
+  AGENTRUNTIME_PAT=<token> agentruntime secrets get 'workspace/live/stripe#API_KEY' --print
+  curl -sS -X POST <api>/v1/secrets/fetch -H "Authorization: Bearer <token>" ...
+```
+
+- The reference **must name its room** (`my/`, `project/` or `workspace/`). A name without a room is
+  refused: a hand-over never guesses which secret you meant. `#FIELD` hands over one field; without
+  it, the whole secret.
+- You must be allowed to view the secret, your own access key must be allowed to fetch it, and the
+  workspace must allow fetching. The key works once and then answers `uses_exhausted`; it cannot read
+  any other secret. Every hand-over is written to the workspace's audit log, and the key shows up in
+  the Console under Settings, API keys, Short-lived access, where it can be revoked.
+- **The token is printed only when standard output is a terminal, and only once.** Redirected or piped
+  (which is how a coding agent's shell runs) the command refuses with exit code 2 and makes nothing,
+  **with or without `--json`**: a key whose token cannot be shown to anyone would only be a loose end.
+  It never writes the token to a file. With `--json` on a terminal the token is part of the JSON
+  (`{"ref","expires_at","uses","token"}`).
+- A hand-over cannot be made through an AI client (`handover_not_for_ai_clients`).
+
+## Render a config file
+
+`secrets render` fills a template with secrets and writes the result, for a program that wants its
+secrets in a config file instead of in its environment.
+
+```sh
+agentruntime secrets render app.conf.tmpl --output app.conf
+agentruntime secrets render app.conf.tmpl --output app.conf --replace
+agentruntime secrets render app.conf.tmpl --output -            # print it, on a terminal only
+```
+
+The template is a Go `text/template`:
+
+```
+database_url = postgres://app:{{ secret "workspace/live/db#PASSWORD" }}@db.example.test/app
+stripe_key   = {{ secret "workspace/live/stripe#API_KEY" | quote }}
+{{ range $name, $value := fields "workspace/live/app" }}{{ $name }}={{ $value | quote }}
+{{ end }}
+```
+
+| Function | What it gives |
+|---|---|
+| `secret "REF#FIELD"` | one field of a secret, as text |
+| `fields "REF"` | every field of a secret as a map: `range` over it, write `(fields "REF").NAME`, or `index (fields "REF") "odd-name"` |
+| `json` | a value as JSON (a string with its quotes, a `fields` map as an object) |
+| `b64enc` | standard base64 of a string |
+| `quote` | a string in double quotes with Go escapes (as Helm's `quote`) |
+
+`printf`, `if`, `range`, `with` and `define` work as in any Go template. To write a literal `{{`, put
+`{{ "{{" }}` in the template. A name that is not in the secret is an **error**, never an empty string
+(also with `index`).
+
+- **Every reference is a quoted string written out in the template.** Not a variable, not a pipeline
+  result, not an expression (`secret $name`, `secret (printf ...)` and `printf ... | secret` are
+  refused). The CLI reads the template first, collects every reference, and refuses anything else, so
+  what a template can read is fixed by its text. All of them are fetched in **one** call, at most 20
+  different references, all or nothing: more than 20 is refused before any call, and if one reference
+  cannot be resolved, or the template fails, **nothing is written**. A whole secret (`fields`) is one
+  reference; so is each `secret "REF#FIELD"`. The same rules apply as for the other commands: the
+  `secret:` prefix, `my/`, `project/`, `workspace/`, a name with no room works only when one room
+  holds it.
+- **A new file** is created with owner-only permissions (`0600` on macOS and Linux; **on Windows it
+  is not**: it keeps the permissions of its folder). An existing file is **never overwritten**.
+- **`--replace`** replaces an existing regular file: the new content is written to a new owner-only
+  file beside it and renamed over it, so a reader sees the old file or the whole new one, and a failure
+  leaves the old one in place. The new file does not inherit the old file's permissions. A link or a
+  folder is refused, and the template itself cannot be the output.
+- **`--output -`** prints the result, only when standard output is a terminal (characters a terminal
+  would act on are shown as `\xNN`); redirected or piped it refuses with exit code 2, before anything
+  is fetched. `--replace` and `--json` make no sense with it.
+- **The rendered file contains your secrets in plain text and stays on disk.** That is what it is
+  for. Keep it out of version control and remove it when you no longer need it. `secrets run
+  --secret-file` is the command that removes its file when the program ends. Anything the template
+  prints into the file is not masked.
+- The same fetch rules as `run`: the key needs the **Fetch secret values** scope and the secrets on its
+  list. Nothing is fetched for a mistake the CLI can see first (a bad template, a template that
+  would not finish, an existing output file, no terminal for `--output -`), so a one-time key is not
+  used up by a typo.
+- **A template runs after the fetch, when a one-use key is already spent, so it is held to limits.**
+  Before the fetch the CLI refuses a template that calls itself (directly or through other
+  templates; it would overflow the stack of the program, which cannot be caught), calls a template
+  that is not defined in the file, nests `if`, `range` or `with` more than 50 deep or calls templates
+  more than 100 deep in a row, writes a number above 1000000 inside `{{ }}`, nests loops over
+  written-out numbers past 1000000 iterations in all, or has a `printf` format with a width or
+  precision above 4096, a `*` or `[n]`, a verb that does not end in a letter, or more than 256 verbs.
+  While the template runs, `printf`, `print`, `println`, `html`, `js`, `urlquery`, `json`, `b64enc`
+  and `quote` stop any one value at 1 MiB and all the text they build at 16 MiB, and `printf`,
+  `print`, `println`, `html`, `js` and `urlquery` refuse a map of fields as an argument (use `json`,
+  or `range`); the output stops at 8 MiB and the whole run at 10 seconds. Nothing is written in any
+  of these cases.
+- **These limits are not a promise about the memory or the time of every possible template.** What
+  is limited is the text those functions build (per value and in all), the output, and the 10
+  seconds. A loop that builds no text runs until the 10 seconds are up, and so does a loop whose
+  count does not come from a number written in the template (a variable, a length, a loop split
+  across templates): the check before the fetch sees only loops over written-out numbers. A run that
+  is stopped cannot be interrupted, only left behind, and keeps using a processor until the command
+  exits (which it does at once).
+- **An error from a running template is a fixed sentence and a line number**
+  (`the template failed at line 3: a name that is not in the secret was used`). The template
+  engine's own messages can quote a secret's value (ranging over a string prints it), and a masker
+  cannot take out a value of one or two characters, so none of the engine's text is shown.
+
+## Short-lived keys
+
+Some access keys are short-lived: a one-time key from `secrets handover`, or a key that a sign-in made
+for a few hours. When the key in use has under 10 minutes left, `run`, `check`, `get` and `render` say
+so on standard error (`note: this key expires in 7 minutes`); the server reports the expiry in the
+`X-Key-Expires` header of its answer. A key that does not expire is never mentioned. If a key saved in a
+profile has an expiry that has passed and the server answers `401`, the CLI says "your short-lived key
+expired; sign in again". A key you give with `--pat` or `AGENTRUNTIME_PAT` has no stored expiry.
+
 ## Version history, recovery and settings
 
 Every save of a secret is a new version, and a deleted secret can be brought back. These commands
@@ -259,7 +396,9 @@ read-only: use the room it really lives in. Every command takes `--json` and `--
   (one JSON document on standard output; errors go to standard error). No command shows a secret's value.
 - `secrets check --json` prints `{"items":[{"ref":...,"resolves":...}]}` and exits `1` when any reference does not
   resolve. `secrets run` passes the command's exit code through. No `secrets` command prints a value to a
-  non-terminal.
+  non-terminal. `secrets render --output PATH` prints one JSON summary with `--json`
+  (`{"written":...,"replaced":...,"bytes":...,"references":...}`, no value). `secrets handover` refuses to run when
+  standard output is not a terminal, with or without `--json`; on a terminal `--json` includes the token.
 
 ## License
 

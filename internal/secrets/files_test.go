@@ -374,3 +374,134 @@ func TestFilesRemoveAll(t *testing.T) {
 		t.Error("paths should be cleared")
 	}
 }
+
+// ---- ReplaceOwnerOnly ----------------------------------------------------------------
+
+// The replacement is atomic: until the final rename the old file is exactly as it was, the new content sits whole in
+// an owner-only file in the SAME folder (so the rename cannot cross a filesystem), and nothing is left behind.
+func TestReplaceOwnerOnlyBuildsTheNewFileBesideTheOldOneThenRenames(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.conf")
+	if err := os.WriteFile(path, []byte("OLD\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	renamed := false
+	orig := renameFile
+	renameFile = func(from, to string) error {
+		renamed = true
+		if filepath.Dir(from) != dir || to != path || from == path {
+			t.Errorf("rename %s -> %s: the new file must sit in the destination's folder", from, to)
+		}
+		if b, _ := os.ReadFile(path); string(b) != "OLD\n" {
+			t.Errorf("the old file was changed before the rename (an in-place write): %q", b)
+		}
+		if b, _ := os.ReadFile(from); string(b) != "NEW\n" {
+			t.Errorf("the temporary file holds %q, want the whole new content", b)
+		}
+		if runtime.GOOS != "windows" {
+			if st, _ := os.Stat(from); st.Mode().Perm() != 0o600 {
+				t.Errorf("temporary file mode %v, want 0600", st.Mode().Perm())
+			}
+		}
+		return orig(from, to)
+	}
+	t.Cleanup(func() { renameFile = orig })
+
+	if err := ReplaceOwnerOnly(path, []byte("NEW\n")); err != nil {
+		t.Fatal(err)
+	}
+	if !renamed {
+		t.Fatal("the content must be moved into place with a rename")
+	}
+	if b, _ := os.ReadFile(path); string(b) != "NEW\n" {
+		t.Errorf("content %q", b)
+	}
+	if runtime.GOOS != "windows" {
+		if st, _ := os.Stat(path); st.Mode().Perm() != 0o600 {
+			t.Errorf("mode %v, want 0600 (the old file's 0644 must not carry over)", st.Mode().Perm())
+		}
+	}
+	if left := dirNames(t, dir); strings.Join(left, ",") != "app.conf" {
+		t.Errorf("files left in the folder: %v", left)
+	}
+}
+
+func TestReplaceOwnerOnlyLeavesTheOldFileWhenTheRenameFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.conf")
+	if err := os.WriteFile(path, []byte("OLD\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := renameFile
+	renameFile = func(from, to string) error { return os.ErrPermission }
+	t.Cleanup(func() { renameFile = orig })
+
+	err := ReplaceOwnerOnly(path, []byte("NEW\n"))
+	if err == nil || !strings.Contains(err.Error(), "left as it was") {
+		t.Fatalf("err = %v", err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "OLD\n" {
+		t.Errorf("the old file changed: %q", b)
+	}
+	if left := dirNames(t, dir); strings.Join(left, ",") != "app.conf" {
+		t.Errorf("the temporary file was left behind: %v", left)
+	}
+}
+
+func TestReplaceOwnerOnlyCreatesAMissingFileAndRefusesWhatIsNotAFile(t *testing.T) {
+	dir := t.TempDir()
+	fresh := filepath.Join(dir, "new.conf")
+	if err := ReplaceOwnerOnly(fresh, []byte("X=1\n")); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(fresh); string(b) != "X=1\n" {
+		t.Errorf("content %q", b)
+	}
+	// A folder is refused, and nothing is written into or beside it.
+	sub := filepath.Join(dir, "folder")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceOwnerOnly(sub, []byte("X")); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("folder: %v", err)
+	}
+	// A missing folder is an error, not a created folder.
+	if err := ReplaceOwnerOnly(filepath.Join(dir, "nope", "a.conf"), []byte("X")); err == nil {
+		t.Error("a missing folder must fail")
+	}
+	if left := dirNames(t, dir); strings.Join(left, ",") != "folder,new.conf" {
+		t.Errorf("files left in the folder: %v", left)
+	}
+}
+
+func TestReplaceOwnerOnlyDoesNotFollowALink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "real.conf")
+	if err := os.WriteFile(target, []byte("REAL\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.conf")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot make a symbolic link here: %v", err)
+	}
+	if err := ReplaceOwnerOnly(link, []byte("NEW\n")); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("a link must be refused, got %v", err)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "REAL\n" {
+		t.Errorf("the file behind the link changed: %q", b)
+	}
+}
+
+func dirNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	return names
+}

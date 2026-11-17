@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -29,6 +31,8 @@ const secretsLong = `Workspace secrets: list and save them, and use them from sc
   agentruntime secrets restore live/stripe --version 2 --scope tenant
   agentruntime secrets deleted --scope tenant                      # Recently deleted
   agentruntime secrets undelete live/stripe --scope tenant
+  agentruntime secrets render app.conf.tmpl --output app.conf      # fill a config file; it stays on disk
+  agentruntime secrets handover workspace/live/stripe#API_KEY      # a one-time key for someone else (terminal only)
 
 A secret reference is  [secret:]<room>/<path>[#<field>]  where the room is my
 (your own secrets), project (the key's project) or workspace. With #field it is
@@ -37,12 +41,19 @@ when exactly one room holds it; otherwise the command fails and lists the rooms.
 run's --env-from and --secret-file take several fields at once, which you name
 yourself: REF#FIELD1,FIELD2.
 
-list and set go through Platform MCP like every other command. run, check and get
-call the API directly with the same access key, and need a key that carries the
-"Fetch secret values" scope (secrets:fetch) and the secrets chosen for it. The
+list and set go through Platform MCP like every other command. run, check, get and
+render call the API directly with the same access key, and need a key that carries
+the "Fetch secret values" scope (secrets:fetch) and the secrets chosen for it. The
 version commands (history, restore, deleted, undelete, delete, and the settings
 flags of set) also call the API directly with the same key; none of them ever
-shows a secret's value. 'vault' is an older name for this command and still works.`
+shows a secret's value. 'vault' is an older name for this command and still works.
+
+render fills a config-file template and writes the file, which stays on disk.
+handover makes a one-time key so that someone else can fetch one secret once; it
+prints the key's token only to a terminal.
+
+When the access key in use is short-lived and has under 10 minutes left, run,
+check, get and render say so on standard error.`
 
 // scopeHelp names the rooms of the Secrets page in the Console.
 const scopeHelp = "room: user (My secrets), project, tenant (workspace) or shared (shared with you; read-only)"
@@ -72,6 +83,7 @@ func (a *App) secretsCmd() *cobra.Command {
 		a.secretsListCmd(), a.secretsSetCmd(), a.secretsDeleteCmd(),
 		a.secretsRunCmd(), a.secretsCheckCmd(), a.secretsGetCmd(),
 		a.secretsHistoryCmd(), a.secretsRestoreCmd(), a.secretsDeletedCmd(), a.secretsUndeleteCmd(),
+		a.secretsHandoverCmd(), a.secretsRenderCmd(),
 	)
 	return cmd
 }
@@ -286,6 +298,10 @@ func (a *App) explainAPI(err error) error {
 	if !errors.As(err, &ae) {
 		return a.explain(err)
 	}
+	// A 401 for a key the profile says has expired is that, not a mystery: say so.
+	if ae.Status == http.StatusUnauthorized && a.storedKeyExpired() {
+		return &ExitErr{Code: ExitError, Err: errors.New("your short-lived key expired; sign in again")}
+	}
 	msg := ae.Error()
 	switch {
 	case ae.Code == "ambiguous_ref" && len(ae.Rooms) > 0:
@@ -297,7 +313,45 @@ func (a *App) explainAPI(err error) error {
 	return &ExitErr{Code: ExitError, Err: errors.New(msg)}
 }
 
-// fetch makes the one API call for refs. The command timeout applies to the call only.
+// storedKeyExpired reports whether the key in use is the saved profile's and the expiry stored with it has passed.
+// A key from a flag or the environment has no stored expiry, so this is false for it.
+func (a *App) storedKeyExpired() bool {
+	exp := a.resolved.TokenExpiresAt
+	return !exp.IsZero() && !a.nowTime().Before(exp)
+}
+
+// keyExpiryWarning is how close to its end a key must be before a command says so.
+const keyExpiryWarning = 10 * time.Minute
+
+// noteKeyExpiry tells the person, on standard error, that the key is about to stop working. The server reports the
+// expiry of a key that has one in a header of the fetch and check answers; nothing is said for a key that does not
+// expire or has more than keyExpiryWarning left.
+func (a *App) noteKeyExpiry(c *bffclient.Client) {
+	exp, ok := c.KeyExpires()
+	if !ok {
+		return
+	}
+	left := exp.Sub(a.nowTime())
+	if left >= keyExpiryWarning {
+		return
+	}
+	fmt.Fprintf(a.Err, "%s this key expires in %s\n", a.stderr.Yellow("note:"), timeLeft(left))
+}
+
+// timeLeft says how long is left in whole minutes, rounded down, so it never promises more than there is.
+func timeLeft(d time.Duration) string {
+	switch m := int(d / time.Minute); {
+	case m < 1:
+		return "less than a minute"
+	case m == 1:
+		return "1 minute"
+	default:
+		return fmt.Sprintf("%d minutes", m)
+	}
+}
+
+// fetch makes the one API call for refs. The command timeout applies to the call only. When the key is close to
+// its end, the person is told.
 func (a *App) fetch(cmd *cobra.Command, c *bffclient.Client, refs []string) (map[string]bffclient.Value, error) {
 	ctx, cancel := a.context(cmd)
 	defer cancel()
@@ -305,6 +359,7 @@ func (a *App) fetch(cmd *cobra.Command, c *bffclient.Client, refs []string) (map
 	if err != nil {
 		return nil, a.explainAPI(err)
 	}
+	a.noteKeyExpiry(c)
 	return values, nil
 }
 
@@ -386,6 +441,7 @@ Exit code 0 when every reference resolves, 1 when any does not.`,
 			if err != nil {
 				return a.explainAPI(err)
 			}
+			a.noteKeyExpiry(c)
 			byRef := make(map[string]bool, len(items))
 			for _, it := range items {
 				byRef[it.Ref] = it.Resolves

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 const (
@@ -23,6 +24,9 @@ const (
 type Profile struct {
 	URL   string `json:"url,omitempty"`
 	Token string `json:"token,omitempty"`
+	// ExpiresAt is when a short-lived key stored in Token stops working (RFC 3339). It is empty for a key that
+	// does not expire. Whoever saves a short-lived key writes it, and whoever replaces or removes the key clears it.
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 // File is the on-disk config document.
@@ -118,6 +122,9 @@ type Resolved struct {
 	Token       string
 	URLSource   string
 	TokenSource string
+	// TokenExpiresAt is the expiry stored with the profile's key. It is set only when the key in use comes from
+	// the saved profile: a key given by flag or environment is not the one the profile's expiry belongs to.
+	TokenExpiresAt time.Time
 }
 
 func firstEnv(keys ...string) (string, string) {
@@ -170,6 +177,9 @@ func (f *File) Resolve(o Overrides) Resolved {
 			r.Token, r.TokenSource = v, src
 		} else if prof != nil && strings.TrimSpace(prof.Token) != "" {
 			r.Token, r.TokenSource = strings.TrimSpace(prof.Token), "profile "+r.Profile
+			if t, err := time.Parse(time.RFC3339, strings.TrimSpace(prof.ExpiresAt)); err == nil {
+				r.TokenExpiresAt = t
+			}
 		}
 	}
 	return r

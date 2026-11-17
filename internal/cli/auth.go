@@ -152,6 +152,7 @@ the AGENTRUNTIME_PAT environment variable and skip login entirely.`,
 				a.cfg.Profiles[name] = prof
 			}
 			prof.Token = token
+			prof.ExpiresAt = "" // a key pasted here has no stored expiry; an old one belonged to the key it replaces
 			if strings.TrimSpace(a.flags.url) != "" || prof.URL == "" {
 				prof.URL = url
 			}
@@ -187,6 +188,7 @@ func (a *App) logoutCmd() *cobra.Command {
 			for _, n := range names {
 				if p := a.cfg.Profiles[n]; p != nil {
 					p.Token = ""
+					p.ExpiresAt = ""
 					fmt.Fprintf(a.Out, "Removed token for profile %q\n", n)
 				}
 			}

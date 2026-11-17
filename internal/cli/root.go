@@ -67,6 +67,15 @@ type App struct {
 	// signalSource replaces the OS signal channel while `secrets run` waits.
 	isTTYOut     func() bool
 	signalSource <-chan os.Signal
+	now          func() time.Time // the clock; nil means time.Now
+}
+
+// nowTime is the current time, from the test clock when one is set.
+func (a *App) nowTime() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 
 // NewApp creates an App bound to the given streams.
