@@ -59,6 +59,17 @@ func Clean(host string) bool {
 	return true
 }
 
+// ExactLoopback reports whether host (no port, no brackets) is exactly one of the three loopback names that may be used
+// over plain http, written as they are in lower case: localhost, 127.0.0.1 or ::1. It is the rule every client of the API
+// and of Platform MCP applies before it sends an access key over http, and it does not fold case: LOCALHOST is not accepted.
+func ExactLoopback(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
 // Official reports whether host (no port) is an AgentRuntime API host: agentruntime.io or a name under it. The exact
 // loopback hosts count too, so the CLI can be tried against a server on this machine. A host with any character
 // outside Clean is never official, whatever it would turn into under another case mapping; neither is a name with a

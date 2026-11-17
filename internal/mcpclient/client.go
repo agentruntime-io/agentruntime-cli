@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/agentruntime-io/agentruntime-cli/internal/apihost"
 	"github.com/agentruntime-io/agentruntime-cli/internal/version"
 )
 
@@ -64,7 +66,52 @@ func (t *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		r.Header.Set("Authorization", "Bearer "+t.token)
 	}
 	r.Header.Set("User-Agent", version.UserAgent())
-	return base.RoundTrip(r)
+	resp, err := base.RoundTrip(r)
+	if err != nil {
+		return nil, err
+	}
+	// A redirect is an error, never a hop: the request carries the access key, and it must not be sent anywhere but to
+	// the address that was configured.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 && resp.StatusCode != http.StatusNotModified {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("the Platform MCP address answered with a redirect (HTTP %d). The CLI never follows redirects, because the request carries your access key: use the final https address as --url (or AGENTRUNTIME_MCP_URL)", resp.StatusCode)
+	}
+	return resp, nil
+}
+
+// newHTTPClient is the HTTP client of an MCP session: it adds the access key and the user agent to every request, and it
+// never follows a redirect (the redirect check here and the error in the round tripper both refuse one).
+func newHTTPClient(token string) *http.Client {
+	return &http.Client{
+		Transport:     &headerRoundTripper{token: strings.TrimSpace(token)},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+// checkEndpoint refuses an address the access key must not be sent to: it must be https, or plain http only for the exact
+// loopback hosts (the one rule the API clients use too, see apihost.ExactLoopback), with no user name and a host made of
+// plain ASCII characters, so that the name that is shown is the name that is dialled. The error never repeats the address.
+func checkEndpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return errors.New("the Platform MCP address is not a valid URL")
+	}
+	if u.User != nil {
+		return errors.New("the Platform MCP address must not carry credentials")
+	}
+	if !apihost.ASCII(u.Hostname()) {
+		return errors.New("the Platform MCP address must use a plain ASCII host name (write an international name in its xn-- form), so that the name shown is the name dialled")
+	}
+	switch u.Scheme {
+	case "https":
+	case "http":
+		if !apihost.ExactLoopback(u.Hostname()) {
+			return errors.New("refusing to send an access key over plain http: use an https Platform MCP address (http is allowed only for localhost, 127.0.0.1 and ::1)")
+		}
+	default:
+		return errors.New("the Platform MCP address must start with https://")
+	}
+	return nil
 }
 
 // Connect opens an MCP session. token may be empty for unauthenticated local servers.
@@ -72,6 +119,9 @@ func Connect(ctx context.Context, endpoint, token string) (*Client, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
 		return nil, errors.New("no MCP endpoint configured")
+	}
+	if err := checkEndpoint(endpoint); err != nil {
+		return nil, err
 	}
 	c := &Client{}
 	client := mcp.NewClient(
@@ -89,7 +139,7 @@ func Connect(ctx context.Context, endpoint, token string) (*Client, error) {
 	)
 	transport := &mcp.StreamableClientTransport{
 		Endpoint:             endpoint,
-		HTTPClient:           &http.Client{Transport: &headerRoundTripper{token: strings.TrimSpace(token)}},
+		HTTPClient:           newHTTPClient(token),
 		DisableStandaloneSSE: true,
 	}
 	sess, err := client.Connect(ctx, transport, nil)
@@ -104,6 +154,9 @@ func explainConnectError(endpoint, token string, err error) error {
 	msg := err.Error()
 	low := strings.ToLower(msg)
 	switch {
+	case strings.Contains(low, "answered with a redirect"):
+		// Checked first: the address in the message may hold digits (a port such as 4010) that read like a status.
+		return fmt.Errorf("connect to %s: %w", endpoint, err)
 	case strings.Contains(low, "401") || strings.Contains(low, "unauthorized"):
 		if token == "" {
 			return fmt.Errorf("%s rejected the request (401): no token configured. Run `agentruntime login`", endpoint)

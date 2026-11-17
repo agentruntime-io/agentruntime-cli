@@ -71,6 +71,11 @@ Precedence: flags > environment > saved profile > defaults.
 Profiles are stored per user in `agentruntime/config.json` under your OS config directory (owner-only
 permissions). Use `agentruntime profile list|use|remove` to manage them.
 
+Every call that carries an access key, to Platform MCP or to the API, is made only over `https` (plain `http` is
+accepted only for the exact hosts `localhost`, `127.0.0.1` and `::1`) and never follows a redirect: an answer that
+redirects stops the command with a clear message, because following it would hand the key to another server. A
+host name must be plain ASCII.
+
 ## Secrets in scripts
 
 `secrets` lists and saves workspace secrets, and hands them to a program without `.env` files.

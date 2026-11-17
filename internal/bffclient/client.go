@@ -188,14 +188,9 @@ func parseBase(base, plainHTTP string) (*url.URL, error) {
 // isLoopback reports whether host is exactly one of the three loopback names that
 // may be used over plain http. It is deliberately not "anything that resolves to
 // the local machine": a name ending in .localhost, or another 127.x.y.z address,
-// is not a promise that the traffic stays on this machine.
-func isLoopback(host string) bool {
-	switch host {
-	case "localhost", "127.0.0.1", "::1":
-		return true
-	}
-	return false
-}
+// is not a promise that the traffic stays on this machine. The rule is shared with the
+// Platform MCP client (apihost.ExactLoopback), so that no client accepts more than another.
+func isLoopback(host string) bool { return apihost.ExactLoopback(host) }
 
 // Fetch asks for the values of refs in one call. It is all or nothing: on any
 // error no value is returned. The map is keyed by the refs as sent.

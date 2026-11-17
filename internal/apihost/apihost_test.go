@@ -162,3 +162,18 @@ func TestDisplayShowsEveryOtherCharacterAsAnEscape(t *testing.T) {
 		}
 	}
 }
+
+func TestExactLoopback(t *testing.T) {
+	for _, h := range []string{"localhost", "127.0.0.1", "::1"} {
+		if !ExactLoopback(h) {
+			t.Errorf("ExactLoopback(%q) = false", h)
+		}
+	}
+	// No case folding and nothing that only resembles the local machine.
+	for _, h := range []string{"", "LOCALHOST", "Localhost", "127.0.0.2", "127.1", "0.0.0.0", "2130706433", "foo.localhost", "localhost.", "localhost.example",
+		"127.0.0.1.example", "[::1]", "::ffff:127.0.0.1", "localhost" + "​", "l" + "а" + "calhost", "127.0.0.1 ", " localhost"} {
+		if ExactLoopback(h) {
+			t.Errorf("ExactLoopback(%q) = true", h)
+		}
+	}
+}
