@@ -40,10 +40,14 @@ type network struct {
 
 type seenRequest struct{ Host, Auth, Path string }
 
-func (n *network) RoundTrip(req *http.Request) (*http.Response, error) {
+func (n *network) record(req *http.Request) {
 	n.mu.Lock()
 	n.seen = append(n.seen, seenRequest{req.URL.Host, req.Header.Get("Authorization"), req.URL.Path})
 	n.mu.Unlock()
+}
+
+func (n *network) RoundTrip(req *http.Request) (*http.Response, error) {
+	n.record(req)
 	return nil, errors.New("recorded: no network in tests")
 }
 
@@ -190,7 +194,7 @@ func storeKey(t *testing.T, issued string) {
 		Token: testToken, ExpiresAt: clockNow.Add(time.Hour).Format(time.RFC3339), IssuedByHost: issued}})
 }
 
-func TestTheSavedKeyIsRefusedToAnotherHostUnlessYesIsGiven(t *testing.T) {
+func TestTheSavedKeyIsRefusedToAnotherHostUnlessAllowOtherHostIsGiven(t *testing.T) {
 	api := newVaultAPI(t)
 	used := authority(&deviceAPI{Server: api.Server})
 	args := []string{"secrets", "check", "--api-url", api.URL, "workspace/live/stripe#API_KEY"}
@@ -200,20 +204,20 @@ func TestTheSavedKeyIsRefusedToAnotherHostUnlessYesIsGiven(t *testing.T) {
 	isolate(t)
 	storeKey(t, "other.example")
 	code, out, errOut := runApp(t, false, atClock, args...)
-	if code != 1 || !strings.Contains(errOut, refusal) || !strings.Contains(errOut, "add --yes") || out != "" || api.count() != 0 {
+	if code != 1 || !strings.Contains(errOut, refusal) || !strings.Contains(errOut, "add --allow-other-host") || strings.Contains(errOut, "add --yes") || out != "" || api.count() != 0 {
 		t.Fatalf("exit %d, %d requests\n%s\n%s", code, api.count(), out, errOut)
 	}
 	if strings.Contains(errOut, testToken) {
 		t.Errorf("the key is in the message:\n%s", errOut)
 	}
 
-	// With --yes (anywhere on the command line): a warning, once, and the key is sent.
-	for _, withYes := range [][]string{append([]string{"--yes"}, args...), append(append([]string{}, args...), "--yes")} {
+	// With --allow-other-host (anywhere on the command line): a warning, once, and the key is sent.
+	for _, withYes := range [][]string{append([]string{"--allow-other-host"}, args...), append(append([]string{}, args...), "--allow-other-host")} {
 		isolate(t)
 		storeKey(t, "other.example")
 		before := api.count()
 		_, _, errOut = runApp(t, false, atClock, withYes...)
-		want := "warning: the saved access key was issued by other.example, but this command talks to " + used + " (sent because of --yes)\n"
+		want := "warning: the saved access key was issued by other.example, but this command talks to " + used + " (sent because of --allow-other-host)\n"
 		if !strings.HasPrefix(errOut, want) || strings.Count(errOut, "warning:") != 1 || api.count() != before+1 {
 			t.Errorf("%v: stderr %q, requests %d -> %d", withYes, errOut, before, api.count())
 		}
@@ -259,10 +263,10 @@ func TestPlatformMCPCommandsRefuseTheSavedKeyToo(t *testing.T) {
 	if code != 1 || !strings.Contains(errOut, "refusing to send the access key saved in profile \"default\" to "+mcpHost+": it was issued by other.example") || srv.last("workflows_list") != nil {
 		t.Fatalf("exit %d, called %v\n%s", code, srv.last("workflows_list"), errOut)
 	}
-	// With --yes it goes, after a warning.
-	code, _, errOut = runApp(t, false, atClock, "--yes", "workflows", "list")
+	// With --allow-other-host it goes, after a warning.
+	code, _, errOut = runApp(t, false, atClock, "--allow-other-host", "workflows", "list")
 	if code != 0 || !strings.HasPrefix(errOut, "warning: the saved access key was issued by other.example, but this command talks to "+mcpHost) || srv.last("workflows_list") == nil {
-		t.Errorf("--yes: exit %d\n%s", code, errOut)
+		t.Errorf("--allow-other-host: exit %d\n%s", code, errOut)
 	}
 	// The host that issued it: neither.
 	isolate(t)
@@ -280,27 +284,6 @@ func TestCommandsThatSendNothingAreNotRefused(t *testing.T) {
 		if code != 0 || strings.Contains(errOut, "refusing") || strings.Contains(errOut, "warning:") {
 			t.Errorf("%v: exit %d\n%s", args, code, errOut)
 		}
-	}
-}
-
-func TestACommandWithItsOwnYesFlagCountsToo(t *testing.T) {
-	// secrets delete has its own --yes (and -y), which shadows the global one: it must lift the refusal as well.
-	for _, flag := range []string{"--yes", "-y"} {
-		isolate(t)
-		storeKey(t, "other.example")
-		api := newVaultAPI(t)
-		code, _, errOut := runApp(t, false, atClock, "secrets", "delete", "live/stripe", "--scope", "tenant", flag, "--api-url", api.URL)
-		if code != 0 || api.count() != 1 || !strings.Contains(errOut, "(sent because of --yes)") {
-			t.Errorf("%s: exit %d, %d requests\n%s", flag, code, api.count(), errOut)
-		}
-	}
-	// Without it the same command is refused before it asks or sends anything.
-	isolate(t)
-	storeKey(t, "other.example")
-	api := newVaultAPI(t)
-	code, _, errOut := runApp(t, false, atClock, "secrets", "delete", "live/stripe", "--scope", "tenant", "--api-url", api.URL)
-	if code != 1 || api.count() != 0 || !strings.Contains(errOut, "refusing to send the access key") {
-		t.Errorf("no --yes: exit %d, %d requests\n%s", code, api.count(), errOut)
 	}
 }
 
@@ -330,13 +313,13 @@ func TestALookalikeIssuingHostIsNeverTheSameHost(t *testing.T) {
 			t.Errorf("%s: the key was sent: %v", c.name, net.requests())
 		}
 	}
-	// With --yes it is sent (to the recorder), and the one request carries the saved key.
+	// With --allow-other-host it is sent (to the recorder), and the one request carries the saved key.
 	isolate(t)
 	net := recordNetwork(t)
 	storeKey(t, "api.agentrunt"+dottedI+"me.io")
-	runApp(t, false, atClock, "--yes", "secrets", "check", "--api-url", "https://api.agentruntime.io", "workspace/live/stripe#API_KEY")
+	runApp(t, false, atClock, "--allow-other-host", "secrets", "check", "--api-url", "https://api.agentruntime.io", "workspace/live/stripe#API_KEY")
 	if reqs := net.requests(); len(reqs) != 1 || reqs[0].Auth != "Bearer "+testToken || reqs[0].Host != "api.agentruntime.io" {
-		t.Errorf("--yes: requests %v", reqs)
+		t.Errorf("--allow-other-host: requests %v", reqs)
 	}
 }
 
@@ -352,13 +335,5 @@ func TestAPlatformMCPAddressWithALookalikeHostIsRefused(t *testing.T) {
 	}
 	if len(net.requests()) != 0 {
 		t.Errorf("the key was sent: %v", net.requests())
-	}
-}
-
-func TestTheGlobalYesFlagIsDocumented(t *testing.T) {
-	isolate(t)
-	_, help, _ := run(t, "", "--help")
-	if !strings.Contains(flat(help), "--yes say yes to what a command would ask, and send a saved short-lived key to a host other than the one that issued it") {
-		t.Errorf("the global --yes flag is not described in the help:\n%s", help)
 	}
 }

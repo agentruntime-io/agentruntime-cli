@@ -69,17 +69,25 @@ type DeviceClient struct {
 // NewDeviceClient validates the API address (https, or http for the exact hosts localhost, 127.0.0.1 and ::1) and
 // builds a client with no key, a request timeout, and no redirect following.
 func NewDeviceClient(base string) (*DeviceClient, error) {
-	u, err := parseBase(base, "refusing to sign in over plain http: the code and the access key would travel unencrypted. Use an https API address (http is allowed only for localhost, 127.0.0.1 and ::1)")
+	u, hc, err := newPublicClient(base, "refusing to sign in over plain http: the code and the access key would travel unencrypted. Use an https API address (http is allowed only for localhost, 127.0.0.1 and ::1)", DeviceHTTPTimeout)
 	if err != nil {
 		return nil, err
 	}
-	return &DeviceClient{
-		base: u,
-		http: &http.Client{
-			Timeout: DeviceHTTPTimeout,
-			// Never follow a redirect: the answers carry codes that must stay between this terminal and this server.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
+	return &DeviceClient{base: u, http: hc}, nil
+}
+
+// newPublicClient is the rule set of every client that calls a public sign-in route before there is any access key:
+// the address is https (plain http only for the exact loopback hosts; plainHTTP is the sentence for a refused one),
+// the client holds no key, every request has a timeout, and a redirect is never followed, because the requests and
+// answers carry codes and keys that must stay between this machine and the server it was pointed at.
+func newPublicClient(base, plainHTTP string, timeout time.Duration) (*url.URL, *http.Client, error) {
+	u, err := parseBase(base, plainHTTP)
+	if err != nil {
+		return nil, nil, err
+	}
+	return u, &http.Client{
+		Timeout:       timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}, nil
 }
 

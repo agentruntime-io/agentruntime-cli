@@ -183,6 +183,7 @@ func TestAKeyIsNeverSentOverPlainHTTPToAHostThatIsNotLoopback(t *testing.T) {
 		"//mcp.agentruntime.io/mcp", "mcp.agentruntime.io/mcp", "/mcp", "not a url",
 		"https://user:pw@mcp.agentruntime.io/mcp", "https://mcp.agentruntime.io@evil.example/mcp", "http://user@localhost/mcp",
 		"https://mcp.agentrunt%C4%B0me.io/mcp", "https://a%E2%84%AA.example.test/mcp", "https://mcp.agentruntime.io%E2%80%8B/mcp",
+		"https://.agentruntime.io/mcp", "https://a..agentruntime.io/mcp", "https://mcp..agentruntime.io/mcp",
 	} {
 		err := connectErr(t, endpoint)
 		if err == nil {

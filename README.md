@@ -40,6 +40,8 @@ go build -o agentruntime .
 agentruntime login                 # paste a personal access token (PAT)
 # or sign in with a code you approve in the Console (a short-lived key that can only fetch secrets):
 # agentruntime login --device --ref 'workspace/live/*'
+# or, in a GitHub Actions job, sign in with the job's own identity (no stored key; see "Sign in from GitHub Actions"):
+# agentruntime login --github-actions --trust <trust-id> --export-env
 agentruntime whoami                # confirm workspace and projects
 agentruntime workflows list
 agentruntime run <workflow-id> --wait
@@ -49,7 +51,7 @@ agentruntime run <workflow-id> --wait
 
 | Area | Commands |
 |---|---|
-| Auth and config | `login` (`--device` signs in with a code), `logout`, `whoami`, `status`, `profile` |
+| Auth and config | `login` (`--device` signs in with a code, `--github-actions` signs a CI job in), `logout`, `whoami`, `status`, `profile` |
 | Workflows | `run`, `await`, `inspect`, `approve`, `reject`, `workflows`, `runs`, `tasks` |
 | Raw tools | `tools list`, `tools describe`, `tools call` (alias: `call`) |
 | Platform | `catalog`, `tenantdata`, `secrets` (alias `vault`), `pats`, `analytics`, `projects` |
@@ -66,7 +68,8 @@ Precedence: flags > environment > saved profile > defaults.
 | Token | `--pat` | `AGENTRUNTIME_PAT` |
 | Endpoint | `--url` | `AGENTRUNTIME_MCP_URL` |
 | Profile | `--profile` | `AGENTRUNTIME_PROFILE` |
-| API address (`secrets run`, `check`, `get`, `render`, `handover`, history and the rest, and `login --device`) | `--api-url` | `AGENTRUNTIME_API_URL` |
+| API address (`secrets run`, `check`, `get`, `render`, `handover`, history and the rest, and `login --device` and `login --github-actions`) | `--api-url` | `AGENTRUNTIME_API_URL` |
+| Audience of the identity token (`login --github-actions`) | `--audience` | `AGENTRUNTIME_WORKLOAD_AUDIENCE` |
 
 Profiles are stored per user in `agentruntime/config.json` under your OS config directory (owner-only
 permissions). Use `agentruntime profile list|use|remove` to manage them.
@@ -375,8 +378,9 @@ The code works for 10m. Waiting for approval (Ctrl-C to cancel)...
   sent; without a terminal it refuses unless you pass `--yes`. `--open` is refused for such a host. That server decides
   which page you are shown and which key you get. The key is saved with the host that issued it (`issued_by_host` in
   the profile). **Every command that sends the saved key to a server (the API commands and the Platform MCP
-  commands) refuses to send it to a host other than the one that issued it** unless you pass `--yes`, and then it
-  prints a warning and sends it. A flag, `AGENTRUNTIME_API_URL` or `AGENTRUNTIME_MCP_URL` that points somewhere
+  commands) refuses to send it to a host other than the one that issued it** unless you pass `--allow-other-host`
+  (a flag of its own: `--yes` only answers prompts and never lifts this, and there is no environment variable for
+  it), and then it prints a warning and sends it. A flag, `AGENTRUNTIME_API_URL` or `AGENTRUNTIME_MCP_URL` that points somewhere
   else is how that happens by mistake. A key given with `--pat` or `AGENTRUNTIME_PAT`, and commands that send
   nothing (`profile`, `logout`, `version`), are not affected. A host name must be **plain ASCII** (letters,
   digits, `.`, `-`; write an international name in its `xn--` form): any other character is refused, because some
@@ -414,10 +418,96 @@ The code works for 10m. Waiting for approval (Ctrl-C to cancel)...
   access key. The API address comes from `--api-url`, `AGENTRUNTIME_API_URL` or the Platform MCP address, as for
   the other commands, and is not saved in the profile.
 
+## Sign in from GitHub Actions
+
+`login --github-actions` lets a GitHub Actions job read secrets without a stored key. The job asks GitHub for an
+**identity token** (an OIDC token that says which repository, branch and workflow is running), the CLI hands it to
+the API together with the id of a **CI trust**, and the API answers with a **short-lived access key** that can only
+fetch the secrets the trust lists. The key is saved in the current profile with its `expires_at`, or, with
+`--export-env`, appended as `AGENTRUNTIME_PAT` to the file GitHub reads to set the environment of the job's next steps.
+
+A workspace admin makes the trust once in the Console (Settings, Workspace, CI sign-in). It names the repository
+and the branch or environment that may sign in, the secrets the key may fetch, and how long a key lasts (15 minutes
+unless the trust says otherwise, at most 1 hour). The Console shows the trust id.
+
+```yaml
+permissions:
+  id-token: write   # lets the job ask GitHub for an identity token
+  contents: read
+steps:
+  - uses: actions/checkout@v4
+  # install the agentruntime CLI here (see Install)
+  - name: Sign in
+    run: agentruntime login --github-actions --trust 11111111-2222-4333-8444-555555555555 --export-env
+  - name: Deploy
+    run: agentruntime secrets run --env STRIPE_KEY=workspace/live/stripe#API_KEY -- ./deploy.sh
+```
+
+```
+::add-mask::<the key, so that GitHub hides it in the log>
+✔ AGENTRUNTIME_PAT is set for the next steps of this job until 2026-11-16 10:15 UTC (in 15 minutes); fetch only
+  Scopes: secrets:fetch
+  Written to the file named by GITHUB_ENV; the key is hidden in this job's log. The current step does not see it.
+```
+
+- **The job needs `permissions: id-token: write`**, in the workflow or in the job. GitHub then gives the job the two
+  variables the CLI reads, `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. Without them the
+  command stops with "the job needs permissions: id-token: write" and sends nothing.
+- **The request token goes to GitHub and nowhere else.** The CLI sends it only to an `https` address on `github.com`
+  or `actions.githubusercontent.com` (or a host under `actions.githubusercontent.com`), with no user name and the
+  default port, and it never follows a redirect. The host is checked exactly as it will be dialled: it must be
+  plain ASCII letters, digits, dots and hyphens, so an address written with a percent escape in the host (such as
+  `%C4%B0`, a capital I with a dot that some case mappings turn into an ordinary `i`), with any other character, or
+  with a trailing dot, is refused. Any other address stops the command before anything is sent. (The
+  exact hosts `localhost`, `127.0.0.1` and `::1` are accepted, so that a test can stand in for GitHub.)
+- **`--trust`** is the id of the trust (36 characters, like `11111111-2222-4333-8444-555555555555`). It is checked
+  before anything is sent, and an error never repeats what was typed: a mistyped value may be a pasted secret.
+- **`--audience`** says who the identity token is for. The default is `https://api.agentruntime.io/workload`;
+  `AGENTRUNTIME_WORKLOAD_AUDIENCE` sets another one for a different environment, and the flag wins over the variable.
+- **The server only says that it refused.** A refused identity token (the branch or environment is not one the trust
+  accepts, the run is a pull request, the audience differs, the trust id is wrong or the trust is turned off, or the
+  token was used before) always gets the same answer, so the CLI prints one fixed sentence and a list of things to
+  check, and never claims which one it is. **Each identity token works once**: when a step fails after the exchange,
+  run the whole step again, which asks GitHub for a new token. Nothing is retried for you.
+- **`--export-env`** prints `::add-mask::<key>` first, which tells GitHub to hide the key in the job's log, and only
+  then appends one line, `AGENTRUNTIME_PAT=<key>`, to the file named by `GITHUB_ENV`. That mask line is the one place
+  the key is printed. The next steps of the job see `AGENTRUNTIME_PAT`; the current step does not. The command refuses
+  when `GITHUB_ENV` is not set, when it does not name a regular file (a folder, a link or a device is refused) or when
+  the file cannot be appended to, and it finds out before it asks GitHub for anything. A file that does not exist is
+  created owner-only (`0600` on macOS and Linux); an existing file keeps its permissions, and a last line without a
+  newline gets one first, so the new line is never glued to it. The profile is not touched.
+- **Without `--export-env`** the key is saved in the profile (`--profile NAME` picks one, else the current one),
+  together with `expires_at` and with `issued_by_host`, the API host that issued it, and the steps after this one in
+  the same job find it there. The profile is not made current, so `whoami` and `workflows` keep using your normal key;
+  and every command that sends the saved key to a server refuses to send it to a host other than the one that issued
+  it unless you pass `--allow-other-host`, as for `login --device`. As with `login --device`, the command
+  refuses to replace a key in the profile that does not expire unless you pass `--replace` (or `--profile NAME`, or
+  use `--export-env`), and it finds an unwritable config folder before the identity token is spent.
+- **Where the key stays.** On GitHub-hosted runners every job gets a fresh machine, so nothing outlives the job. **On a
+  self-hosted runner that keeps its home folder between jobs the key stays in `config.json` until it expires** (15
+  minutes unless the trust says otherwise, at most 1 hour). `--export-env` and `--profile` suit ephemeral runners: on a
+  runner that is reused, prefer `--export-env` (the key goes only to the file the runner provides for the next steps),
+  or point `AGENTRUNTIME_CONFIG` at a folder that is removed after the job.
+- **Which API host.** Before it asks GitHub for anything the command prints `API host: <host>` on standard error, so
+  the log of the run shows where the identity token goes. A host that is not an `agentruntime.io` host (or one of the
+  loopback hosts) also gets a warning. No confirmation is asked here, because whoever wrote the workflow already
+  holds both variables the command needs and chose the address; an address whose host is not plain ASCII is refused
+  as everywhere else.
+- **The CLI never prints the identity token, the request token or the key** (apart from the `::add-mask::` line), in
+  any message, error or note, and what the server or GitHub says is never repeated: errors are fixed sentences. The
+  calls follow the rules of the other CLI calls: an `https` API address (plain `http` only for `localhost`,
+  `127.0.0.1` and `::1`), no redirect is followed, answers are size-capped and every request times out. The call to
+  the API carries no access key.
+- Exit codes: `0` signed in, `1` refused or failed (no identity token permission, an address that is not GitHub's, a
+  refused identity token, an answer that cannot be read, `GITHUB_ENV` unusable), `2` bad flags, `130` Ctrl-C. Nothing is
+  saved or written unless it ends with `0`.
+
+
 ## Short-lived keys
 
-Some access keys are short-lived: a one-time key from `secrets handover`, or a key that a sign-in made
-for a few hours (`login --device` saves it in the profile with its `expires_at`). When the key in use has under 10 minutes left, `run`, `check`, `get` and `render` say
+Some access keys are short-lived: a one-time key from `secrets handover`, a key that a sign-in made
+for a few hours (`login --device` saves it in the profile with its `expires_at`), or a key a CI job got for a few
+minutes (`login --github-actions`). When the key in use has under 10 minutes left, `run`, `check`, `get` and `render` say
 so on standard error (`note: this key expires in 7 minutes`); the server reports the expiry in the
 `X-Key-Expires` header of its answer. A key that does not expire is never mentioned. If a key saved in a
 profile has an expiry that has passed and the server answers `401`, the CLI says "your short-lived key
@@ -510,6 +600,9 @@ read-only: use the room it really lives in. Every command takes `--json` and `--
 - `login --device` prints the code and the address on standard output even when it is piped (the code is not a secret), never
   the key or the device code, and ignores `--json`. Exit codes: `0` signed in, `1` denied, expired, or failed, `2` bad flags,
   `130` Ctrl-C. Nothing is saved unless it ends with `0`.
+- `login --github-actions` prints nothing that holds a key, an identity token or the request token, except the line
+  `::add-mask::<key>` that `--export-env` prints first (and `--json` changes nothing). Exit codes: `0` signed in, `1`
+  refused or failed, `2` bad flags, `130` Ctrl-C.
 
 ## License
 

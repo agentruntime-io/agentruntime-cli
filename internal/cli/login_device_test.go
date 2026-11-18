@@ -1135,7 +1135,7 @@ func TestSavedKeyIsUsedByTheFetchCommandsAndItsExpiryIsRemembered(t *testing.T) 
 	}
 	api := newVaultAPI(t) // answers 401 for any key but the test key
 	e.now = clockNow.Add(2 * time.Hour)
-	code, _, errOut := runApp(t, false, e.tweak, "--yes", "secrets", "check", "--api-url", api.URL, "workspace/live/stripe#API_KEY")
+	code, _, errOut := runApp(t, false, e.tweak, "--allow-other-host", "secrets", "check", "--api-url", api.URL, "workspace/live/stripe#API_KEY")
 	if code != 1 || !strings.Contains(errOut, "your short-lived key expired; sign in again") {
 		t.Errorf("exit %d\n%s", code, errOut)
 	}
@@ -1380,6 +1380,19 @@ func TestLoginHelpAndReadmeDescribeTheDeviceSignIn(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("README lacks %q", want)
+		}
+	}
+}
+
+// A host with an empty label is never in the API's family, whatever the suffix test would say about it.
+func TestAPIFamilyRefusesAnEmptyLabel(t *testing.T) {
+	for _, c := range []struct{ api, host string }{
+		{"api.agentruntime.io", ".agentruntime.io"}, {"api.agentruntime.io", "a..agentruntime.io"}, {"api.agentruntime.io", "..agentruntime.io"},
+		{"api.agentruntime.io", "console..agentruntime.io"}, {".agentruntime.io", "console.agentruntime.io"}, {"api..agentruntime.io", "api..agentruntime.io"},
+		{".agentruntime.io", ".agentruntime.io"},
+	} {
+		if inAPIFamily(c.api, c.host) {
+			t.Errorf("inAPIFamily(%q, %q) = true", c.api, c.host)
 		}
 	}
 }

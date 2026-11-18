@@ -665,7 +665,7 @@ func TestHelpAndReadmeWarnAboutWhoApprovesAndWhichServer(t *testing.T) {
 		"Only run login --device yourself, only approve your own sign-ins",
 		`Someone who says "send me the code, I will approve it" approves from their own account`,
 		"--replace removes the old key from the profile and says so; it does not revoke it on the server",
-		"The profile is not made your current one", "refuse to send it to a different host unless you pass --yes", "A host name must be plain ASCII",
+		"The profile is not made your current one", "refuse to send it to a different host unless you pass --allow-other-host", "A host name must be plain ASCII",
 		"The machine's host name is sent as the device name",
 		`--device-name ""`,
 	} {

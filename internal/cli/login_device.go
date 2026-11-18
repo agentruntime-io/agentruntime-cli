@@ -72,7 +72,7 @@ use --profile NAME to keep both. --replace removes the old key from the profile
 and says so; it does not revoke it on the server. The profile is not made your
 current one: pass --profile NAME (or set AGENTRUNTIME_PROFILE) to use the key. The
 key is saved with the host that issued it, and the commands that send it to a server
-refuse to send it to a different host unless you pass --yes. A host name must be plain
+refuse to send it to a different host unless you pass --allow-other-host. A host name must be plain
 ASCII (an international name in its xn-- form). An AGENTRUNTIME_PAT in your environment still
 overrides the saved key.
 
@@ -95,8 +95,9 @@ type deviceFlags struct {
 	deviceNameSet bool
 }
 
-// deviceOnlyFlags are the names of the flags in deviceFlags, so using one without --device is a usage error.
-var deviceOnlyFlags = []string{"ref", "all", "ttl", "scope", "open", "device-name", "api-url", "replace"}
+// deviceOnlyFlags are the names of the flags in deviceFlags that only make sense with --device, so using one without
+// it is a usage error. --api-url and --replace are shared with --github-actions (see signInFlags).
+var deviceOnlyFlags = []string{"ref", "all", "ttl", "scope", "open", "device-name"}
 
 // hostnameFn is the machine's name, the default device name. A test seam.
 var hostnameFn = os.Hostname
@@ -122,8 +123,8 @@ func addDeviceFlags(cmd *cobra.Command, f *deviceFlags) {
 	fl.StringSliceVar(&f.scopes, "scope", nil, "with --device: also ask for this scope: vault:read (list secret names); secrets:fetch is always asked for")
 	fl.BoolVar(&f.open, "open", false, "with --device: open the sign-in address in your browser (only an https address on the API's own domain, and only for an agentruntime.io API host)")
 	fl.StringVar(&f.deviceName, "device-name", "", "with --device: the name the approver sees (default: this machine's host name; --device-name \"\" sends a generic name instead)")
-	fl.StringVar(&f.apiURL, "api-url", "", "with --device: "+apiURLHelp)
-	fl.BoolVar(&f.replace, "replace", false, "with --device: replace a key that does not expire in the profile (by default that is refused)")
+	fl.StringVar(&f.apiURL, "api-url", "", "with --device or --github-actions: "+apiURLHelp)
+	fl.BoolVar(&f.replace, "replace", false, "with --device or --github-actions: replace a key that does not expire in the profile (by default that is refused)")
 }
 
 // loginDevice runs the whole device sign-in.
@@ -242,22 +243,23 @@ func (a *App) confirmForeignAPI(authority, host string, yes bool) error {
 // checkKeyHost is called by every command that is about to send the key saved in the profile to a server. A short-lived
 // key belongs to the host that issued it (login --device saves it with that host); when a flag, an environment
 // variable or another profile setting points the command at a different host, sending the key there would hand it to a
-// server that did not make it. That is refused, unless --yes says it is meant, and then the key is sent after a warning.
+// server that did not make it. That is refused, unless --allow-other-host says it is meant, and then the key is sent after a warning.
+// --yes does not lift it: it answers prompts, and a prompt is not a decision about where a key may go.
 // authority is the host the command will dial (empty when its name is not plain ASCII) and shown is the text for it.
 func (a *App) checkKeyHost(authority, shown string) error {
 	issued := a.resolved.TokenIssuedByHost
 	if issued == "" || (authority != "" && apihost.Same(issued, authority)) {
 		return nil
 	}
-	if !a.flags.yes {
+	if !a.flags.allowOtherHost {
 		return &ExitErr{Code: ExitError, Err: fmt.Errorf(
 			"refusing to send the access key saved in profile %q to %s: it was issued by %s, and a key must only go to the host that issued it. "+
-				"If a flag or an environment variable pointed this command at that host by mistake, fix it; if you mean it, add --yes",
+				"If a flag or an environment variable pointed this command at that host by mistake, fix it; if you mean it, add --allow-other-host",
 			safeLine(a.resolved.Profile), shown, apihost.Display(issued))}
 	}
 	if !a.warnedKeyHost {
 		a.warnedKeyHost = true
-		fmt.Fprintf(a.Err, "%s the saved access key was issued by %s, but this command talks to %s (sent because of --yes)\n",
+		fmt.Fprintf(a.Err, "%s the saved access key was issued by %s, but this command talks to %s (sent because of --allow-other-host)\n",
 			a.stderr.Yellow("warning:"), apihost.Display(issued), shown)
 	}
 	return nil
@@ -566,7 +568,7 @@ func parseVerificationURL(raw string) (*url.URL, error) {
 // example.com and everything under it. An IP address matches only itself.
 func inAPIFamily(apiHost, host string) bool {
 	// ASCII letters only: Unicode case mapping would let a lookalike host (U+0130, the Kelvin sign) pass as an official one.
-	if !apihost.Clean(apiHost) || !apihost.Clean(host) {
+	if !apihost.Clean(apiHost) || !apihost.Clean(host) || apihost.EmptyLabel(apiHost) || apihost.EmptyLabel(host) {
 		return false
 	}
 	apiHost, host = apihost.Fold(apiHost), apihost.Fold(host)

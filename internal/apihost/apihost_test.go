@@ -177,3 +177,56 @@ func TestExactLoopback(t *testing.T) {
 		}
 	}
 }
+
+func TestLoopback(t *testing.T) {
+	for _, h := range []string{"localhost", "LOCALHOST", "127.0.0.1", "::1"} {
+		if !Loopback(h) {
+			t.Errorf("Loopback(%q) = false", h)
+		}
+	}
+	for _, h := range []string{"", "127.0.0.2", "127.1", "0.0.0.0", "2130706433", "foo.localhost", "localhost.", "localhost.example", "[::1]", "::ffff:127.0.0.1",
+		"localhost" + zeroWidth, "l" + cyrA + "calhost", "127.0.0.1 ", "127.0.0.1\t"} {
+		if Loopback(h) {
+			t.Errorf("Loopback(%q) = true", h)
+		}
+	}
+}
+
+func TestUnder(t *testing.T) {
+	const domain = "actions.githubusercontent.com"
+	for _, h := range []string{domain, "ACTIONS.GitHubUserContent.COM", "pipelines." + domain, "a.b." + domain} {
+		if !Under(h, domain) {
+			t.Errorf("Under(%q) = false", h)
+		}
+	}
+	for _, h := range []string{"", "githubusercontent.com", "evil" + domain, "not" + domain, domain + ".", domain + ".evil.example", "evil.example/" + domain,
+		"." + domain, "a..b." + domain, "pipelines" + zeroWidth + "." + domain, dottedI + "." + domain, "a" + kelvin + "." + domain,
+		"actions.g" + dottedI + "thubusercontent.com", "%C4%B0." + domain, "a_b." + domain, "a b." + domain, domain + ":443"} {
+		if Under(h, domain) {
+			t.Errorf("Under(%q) = true", h)
+		}
+	}
+}
+
+func TestEmptyLabelAndTheHostsThatHaveOne(t *testing.T) {
+	for _, h := range []string{".", "..", ".agentruntime.io", "..agentruntime.io", "a..agentruntime.io", "api..agentruntime.io", "agentruntime..io", "a.b..c", ".localhost"} {
+		if !EmptyLabel(h) {
+			t.Errorf("EmptyLabel(%q) = false", h)
+		}
+		if Official(h) {
+			t.Errorf("Official(%q) = true: a name with an empty label is not an AgentRuntime host", h)
+		}
+		if Under(h, "agentruntime.io") {
+			t.Errorf("Under(%q, agentruntime.io) = true", h)
+		}
+	}
+	for _, h := range []string{"", "a", "agentruntime.io", "api.agentruntime.io", "a.b.c", "127.0.0.1", "::1", "xn--a-b"} {
+		if EmptyLabel(h) {
+			t.Errorf("EmptyLabel(%q) = true", h)
+		}
+	}
+	// A single trailing dot is not an empty label here, and is still not official.
+	if EmptyLabel("api.agentruntime.io.") || Official("api.agentruntime.io.") || Under("api.agentruntime.io.", "agentruntime.io") {
+		t.Error("a trailing dot is handled wrongly")
+	}
+}

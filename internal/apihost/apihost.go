@@ -70,20 +70,44 @@ func ExactLoopback(host string) bool {
 	return false
 }
 
+// Loopback reports whether host (no port, no brackets) is exactly one of the three loopback names a test may use over plain
+// http: localhost, 127.0.0.1 or ::1 (ASCII letter case ignored). Nothing else counts as the local machine: not a name
+// ending in .localhost, not another 127.x.y.z address, not an alternative way of writing an address.
+func Loopback(host string) bool {
+	if !Clean(host) {
+		return false
+	}
+	switch Fold(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
+}
+
+// EmptyLabel reports whether host has an empty label: a leading dot, or two dots in a row. (A single trailing dot is the
+// root label of a fully qualified name; it is not counted here, and Official and Under refuse it on their own.) A name
+// with an empty label is not a name: a resolver, or a proxy that is handed the name, may read it as something else.
+func EmptyLabel(host string) bool {
+	return strings.HasPrefix(host, ".") || strings.Contains(host, "..")
+}
+
+// Under reports whether host (no port) is domain or a name under it. host must be Clean and made of non-empty labels:
+// a host with any other character, a leading or trailing dot, or two dots in a row is never under a domain. Letter case is folded for the ASCII letters only,
+// and domain is written in lower case.
+func Under(host, domain string) bool {
+	if !Clean(host) || EmptyLabel(host) || strings.HasSuffix(host, ".") {
+		return false
+	}
+	h := Fold(host)
+	return h == domain || strings.HasSuffix(h, "."+domain)
+}
+
 // Official reports whether host (no port) is an AgentRuntime API host: agentruntime.io or a name under it. The exact
 // loopback hosts count too, so the CLI can be tried against a server on this machine. A host with any character
 // outside Clean is never official, whatever it would turn into under another case mapping; neither is a name with a
 // trailing dot.
 func Official(host string) bool {
-	if !Clean(host) {
-		return false
-	}
-	h := Fold(host)
-	switch h {
-	case "localhost", "127.0.0.1", "::1", "agentruntime.io":
-		return true
-	}
-	return strings.HasSuffix(h, ".agentruntime.io")
+	return Loopback(host) || Under(host, "agentruntime.io")
 }
 
 // Authority is the host of u as it is dialled, shown, stored and compared: ASCII letters in lower case, an IPv6

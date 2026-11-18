@@ -72,11 +72,12 @@ func (a *App) confirm(prompt string) (bool, error) {
 
 func (a *App) loginCmd() *cobra.Command {
 	var token string
-	var withToken, noVerify, device bool
+	var withToken, noVerify, device, githubActions bool
 	var dev deviceFlags
+	var gh workloadFlags
 	cmd := &cobra.Command{
 		Use:   "login",
-		Short: "Save a personal access token (PAT) for this profile, or sign in with a code (--device)",
+		Short: "Save a personal access token (PAT) for this profile, or sign in with a code (--device) or from GitHub Actions (--github-actions)",
 		Long: `Stores a PAT (and optionally a custom MCP URL) in the CLI config and makes the
 profile current. Create a PAT in the Console under Settings → API tokens.
 
@@ -85,6 +86,7 @@ profile current. Create a PAT in the Console under Settings → API tokens.
   echo $PAT | agentruntime login --with-token # from stdin (CI)
   agentruntime login --profile dev --url http://127.0.0.1:8340/mcp
   agentruntime login --device --ref 'workspace/live/*'   # sign in with a code, see below
+  agentruntime login --github-actions --trust ID         # sign a GitHub Actions job in, see below
 
 The token is stored in the config file with owner-only permissions. In CI prefer
 the AGENTRUNTIME_PAT environment variable and skip login entirely.
@@ -93,19 +95,50 @@ the AGENTRUNTIME_PAT environment variable and skip login entirely.
 the Console, and a short-lived key that can only fetch secrets is saved in the
 profile.
 
-` + deviceLoginLong,
+` + deviceLoginLong + `
+
+` + githubActionsLoginLong,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if device && githubActions {
+				return &ExitErr{Code: ExitUsage, Err: errors.New("--device and --github-actions cannot be combined")}
+			}
 			if device {
 				if token != "" || withToken || noVerify {
 					return &ExitErr{Code: ExitUsage, Err: errors.New("--device cannot be combined with --token, --with-token or --no-verify")}
 				}
 				dev.deviceNameSet = cmd.Flags().Changed("device-name")
+				for _, name := range workloadOnlyFlags {
+					if cmd.Flags().Changed(name) {
+						return &ExitErr{Code: ExitUsage, Err: fmt.Errorf("--%s only works with --github-actions", name)}
+					}
+				}
 				return a.loginDevice(cmd, dev)
+			}
+			if githubActions {
+				if token != "" || withToken || noVerify {
+					return &ExitErr{Code: ExitUsage, Err: errors.New("--github-actions cannot be combined with --token, --with-token or --no-verify")}
+				}
+				for _, name := range deviceOnlyFlags {
+					if cmd.Flags().Changed(name) {
+						return &ExitErr{Code: ExitUsage, Err: fmt.Errorf("--%s only works with --device", name)}
+					}
+				}
+				return a.loginGitHubActions(cmd, gh, dev)
 			}
 			for _, name := range deviceOnlyFlags {
 				if cmd.Flags().Changed(name) {
 					return &ExitErr{Code: ExitUsage, Err: fmt.Errorf("--%s only works with --device", name)}
+				}
+			}
+			for _, name := range signInFlags {
+				if cmd.Flags().Changed(name) {
+					return &ExitErr{Code: ExitUsage, Err: fmt.Errorf("--%s only works with --device or --github-actions", name)}
+				}
+			}
+			for _, name := range workloadOnlyFlags {
+				if cmd.Flags().Changed(name) {
+					return &ExitErr{Code: ExitUsage, Err: fmt.Errorf("--%s only works with --github-actions", name)}
 				}
 			}
 			if err := a.loadConfig(); err != nil {
@@ -191,7 +224,9 @@ profile.
 	cmd.Flags().BoolVar(&withToken, "with-token", false, "read the PAT from stdin")
 	cmd.Flags().BoolVar(&noVerify, "no-verify", false, "save without checking the token against the server")
 	cmd.Flags().BoolVar(&device, "device", false, "sign in with a code you approve in the Console; saves a short-lived key that can only fetch secrets")
+	cmd.Flags().BoolVar(&githubActions, "github-actions", false, "sign a GitHub Actions job in with its identity token; saves a short-lived key that can only fetch secrets")
 	addDeviceFlags(cmd, &dev)
+	addWorkloadFlags(cmd, &gh)
 	return cmd
 }
 

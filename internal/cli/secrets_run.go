@@ -143,7 +143,7 @@ started at all when a reference cannot be resolved (all or nothing).`,
 		Example: `  agentruntime secrets run --env STRIPE_KEY=workspace/live/stripe#API_KEY -- python job.py
   agentruntime secrets run --env-from workspace/live/stripe#API_KEY,WEBHOOK_SECRET -- ./deploy.sh
   agentruntime secrets run --secret-file .env=workspace/live/app#DB_USER,DB_PASS -- docker compose up
-  agentruntime secrets run --secret-file creds.json=my/gcp -- terraform plan`,
+  agentruntime secrets run --secret-file creds.json=my/cloud -- ./deploy.sh`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dash := cmd.ArgsLenAtDash()

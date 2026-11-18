@@ -48,7 +48,10 @@ type globalFlags struct {
 	json    bool
 	noColor bool
 	timeout time.Duration
-	yes     bool // the global --yes (or the --yes of the command that has its own): say yes to what would be asked or refused
+	yes     bool // the global --yes: say yes to what a command would ask (login --device: an API host outside agentruntime.io)
+	// allowOtherHost lets a command send the saved short-lived key to a host other than the one that issued it. It is its own
+	// flag, apart from --yes: confirming a prompt must never also lift that refusal.
+	allowOtherHost bool
 }
 
 // App holds IO and lazily-created connection state shared by all commands.
@@ -162,15 +165,12 @@ AGENTRUNTIME_MCP_URL, AGENTRUNTIME_PROFILE) > saved profile > defaults.`,
 	pf.BoolVar(&a.flags.json, "json", false, "print raw JSON instead of formatted output")
 	pf.BoolVar(&a.flags.noColor, "no-color", false, "disable coloured output")
 	pf.DurationVar(&a.flags.timeout, "timeout", defaultTimout, "overall timeout for the command")
-	pf.BoolVar(&a.flags.yes, "yes", false, "say yes to what a command would ask, and send a saved short-lived key to a host other than the one that issued it (refused without this)")
+	pf.BoolVar(&a.flags.yes, "yes", false, "say yes to what a command would ask (login --device: an API host outside agentruntime.io)")
+	pf.BoolVar(&a.flags.allowOtherHost, "allow-other-host", false, "send a saved short-lived key to a host other than the one that issued it (refused without this; --yes does not do it)")
 
 	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
 		a.stdout = render.NewStyle(a.Out, a.flags.noColor)
 		a.stderr = render.NewStyle(a.Err, a.flags.noColor)
-		// A command with its own --yes (approve, delete, ...) shadows the global one: read whichever this command has.
-		if f := cmd.Flags().Lookup("yes"); f != nil && f.Value.String() == "true" {
-			a.flags.yes = true
-		}
 	}
 
 	root.AddCommand(

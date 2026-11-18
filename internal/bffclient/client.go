@@ -170,6 +170,9 @@ func parseBase(base, plainHTTP string) (*url.URL, error) {
 	if !apihost.ASCII(u.Hostname()) {
 		return nil, errors.New("the API address must use a plain ASCII host name (write an international name in its xn-- form), so that the name shown is the name dialled")
 	}
+	if apihost.EmptyLabel(u.Hostname()) {
+		return nil, errors.New("the API address has an empty part in its host name (a leading dot, or two dots in a row)")
+	}
 	switch u.Scheme {
 	case "https":
 	case "http":
